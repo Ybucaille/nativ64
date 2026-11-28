@@ -126,6 +126,20 @@ pub fn image_base_of(addr: usize) -> Option<usize> {
         .map(|r| r.0)
 }
 
+/// Like [`image_base_of`] but never waits: `None` when the table is locked, so that logging
+/// from an exception path cannot deadlock on a lock the faulting code holds.
+pub(crate) fn image_base_of_try(addr: usize) -> Option<usize> {
+    let ranges = match IMAGE_RANGES.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return None,
+    };
+    ranges
+        .iter()
+        .find(|&&(b, s)| addr >= b && addr - b < s)
+        .map(|r| r.0)
+}
+
 /// Hooks the base installs so that threads made by `CreateThread` / `_beginthreadex` get what
 /// guest code needs on any thread (a TEB, static TLS, thread attach notifications).
 #[derive(Clone, Copy)]

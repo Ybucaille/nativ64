@@ -81,7 +81,19 @@ unsafe fn call_handler(
 
 /// Invokes the invalid parameter handler without information (for the `_s` functions of other
 /// modules). Sets nothing; returns when the handler returns or when none is installed.
+#[track_caller]
 pub(crate) fn invalid_parameter() {
+    if crate::log::on(crate::log::CRT) {
+        eprintln!(
+            "nativ64: invalid parameter at {} (handler {})",
+            std::panic::Location::caller(),
+            if current_handler() != 0 {
+                "installed"
+            } else {
+                "none"
+            }
+        );
+    }
     unsafe {
         call_handler(std::ptr::null(), std::ptr::null(), std::ptr::null(), 0, 0);
     }
@@ -89,6 +101,7 @@ pub(crate) fn invalid_parameter() {
 
 /// Sets `errno` to `err`, invokes the handler, and returns `err` (the `_VALIDATE_RETURN_ERRCODE`
 /// pattern).
+#[track_caller]
 pub(crate) fn invalid_parameter_err(err: i32) -> i32 {
     set_errno(err);
     invalid_parameter();

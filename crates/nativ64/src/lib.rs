@@ -50,6 +50,7 @@ pub mod chad;
 pub mod com;
 pub mod gameinput;
 pub mod handles;
+mod log;
 pub mod mmdevapi;
 pub mod msvcp140;
 pub mod paths;

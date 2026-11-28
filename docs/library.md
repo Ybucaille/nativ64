@@ -57,6 +57,11 @@ needs). Their objects are `Table<N>`s of untyped slots built with `table!`; a sl
 is `slot_trap::<AREA, SLOT>` which logs the area and slot once and answers `E_NOTIMPL`. Every
 other API is refused and logged.
 
+Diagnostics on stderr are off unless `NATIV64_LOG` lists channels (comma separated, read once):
+`debug` echoes the strings passed to `OutputDebugString*`, `seh` prints each exception as its
+dispatch starts (software ones too), `crt` prints each invalid parameter the C runtime rejects
+with the nativ64 function that raised it, `all` turns on every channel.
+
 `GameInput.dll` is imported by ordinal: `src/gameinput.rs` has an `ORDINALS` table like
 `ws2_32`, wired in `lookup_ordinal`. It exposes an `IGameInput` with one virtual gamepad (always
 connected; device callbacks enumerate it, readings answer `GetGamepadState`). Buttons come from

@@ -957,12 +957,40 @@ fn dispatcher(f: &Frame, target_ip: usize, context: *mut u8) -> DispatcherContex
 /// execution; false when nobody took the exception (a handler that takes it by unwinding never
 /// returns).
 unsafe fn search(rec: *mut ExceptionRecord, ctx: *mut u8) -> bool {
+    if crate::log::on(crate::log::SEH) {
+        log_exception(rec, ctx);
+    }
     ACTIVE.with(|a| a.borrow_mut().push(ctx as usize));
     let r = search_frames(rec, ctx);
     ACTIVE.with(|a| {
         a.borrow_mut().pop();
     });
     r
+}
+
+/// `NATIV64_LOG=seh`: one line per exception as its dispatch starts: its code, where it was
+/// raised, the faulting instruction and the record's two information words. Software
+/// exceptions show too, which `NATIV64_TRACE_FAULTS` does not see.
+fn log_exception(rec: *const ExceptionRecord, ctx: *const u8) {
+    use crate::log::At;
+    // SAFETY: the dispatcher only passes records it built.
+    let Some(r) = (unsafe { rec.as_ref() }) else {
+        return;
+    };
+    let rip = if ctx.is_null() {
+        0
+    } else {
+        // SAFETY: a non-NULL context is a valid CONTEXT (see `dispatch_fault`).
+        unsafe { Ctx(ctx as *mut u8).get(CONTEXT_RIP_OFF) as usize }
+    };
+    eprintln!(
+        "nativ64: exception {:#x} at {} rip {} info {:#x} {:#x}",
+        r.code,
+        At(r.address),
+        At(rip),
+        r.info[0],
+        r.info[1]
+    );
 }
 
 unsafe fn search_frames(rec: *mut ExceptionRecord, ctx: *mut u8) -> bool {
