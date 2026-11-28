@@ -501,6 +501,65 @@ facts in `Masks`, the table and emitter in `spirv/`):
   whole-wave tails), `v_permlanex16` 1151 (cs 923), `s_ff1` cs 787, `v_writelane` cs 709.
   `--structure --stats` now prints the first failing blob of each error kind.
 
+**As built (7c)** (same corpus; `structure/wave.rs`, `structure/uniform.rs`, the subgroup
+operations in `spirv/emit.rs` and `spirv/emit/stage.rs`):
+- **Whole-wave sections** (item 5). A section is the code of one block from an
+  `s_or_saveexec` with all-ones to the `s_mov` that restores the saved EXEC. It is simulated on
+  32 or 64 lanes; each lane holds a constant, or the combination by one operation of a set of
+  lanes of one value. Modelled: `s_mov exec, const`, DPP16 (quad, row shifts / rotates /
+  mirrors / share / xmask) and DPP8, `v_permlane(x)16`, `v_readlane` at a constant lane,
+  `v_readfirstlane`, add / min / max (u32, i32, f32) and and / or / xor, and the
+  inclusive-minus-own subtraction. A value read after the section must be a `Reduce`,
+  `InclusiveScan` or `ExclusiveScan` of its input over all lanes: it becomes
+  `OpGroupNonUniform*` (`LaneUse::WaveOut`) and the rest of the lane-crossing instructions are
+  dropped (`WaveSkip`). The input must be defined inside the section, before its use (the
+  `v_cndmask` that sets inactive lanes to the identity); the emitter keeps its value in a
+  variable of its own. The old value of a VGPR that is written in every lane is not a read, so
+  a later section may reuse the temporaries. Anything else refuses the whole section. The DPP
+  row rotate direction is **[unverified]** (reductions and scans do not depend on it as far as
+  the corpus shows). Float sums take the host's order.
+- **Quad operations** (item 6). `ds_swizzle_b32` in quad mode (or bitmask mode that leaves the
+  bits above the quad alone), DPP `quad_perm` and a `dpp8` that is the same in both quads:
+  `QuadBroadcast`, `QuadSwap`, or a select over broadcasts on the host lane's low two bits.
+  Helper invocations get no special handling beyond what the host's quad operations give
+  **[unverified on a device]**.
+- **Masks as data** (item 7). `s_bcnt1` = ballot bit count; `s_ff1` read only by `v_readlane` =
+  `BallotFindLSB` then `Shuffle`; `v_mbcnt` of a mask = exclusive ballot count; `s_cmp_eq/lg`
+  of a mask with zero or with a mask = `Any` / `All`. In a program that reads the console lane
+  index, the three that number host lanes stay refused. A spill slot may hold a lane mask (the
+  lane's bit); each `v_readlane` takes the kind of the writes it can see, so a compiler may
+  reuse a lane for both kinds (a read that may see both refuses the VGPR).
+- **Refusals** (item 8) are what the structurer already reports as cross-lane, by instruction
+  name: `v_readlane` at a computed lane, `v_writelane` outside slots, `ds_bpermute`, DPP and
+  `v_permlanex16` outside a modelled section, swizzles that leave the quad.
+- Every program with a subgroup operation declares `MaximallyReconvergesKHR`.
+- **Wave evaluator**: `interp_wave` runs the lanes in lock step with a host width (subgroup
+  results computed per group of that width).
+- **Not done**: the lock-step run still requires every lane to take the same path and reads the
+  `Wave` vote as `Lane`; the device probe keeps `LocalSize` 1 (no per-lane comparison on a
+  device); the backend does not yet require the subgroup features and
+  `VK_KHR_shader_maximal_reconvergence` at device creation; scalar bits as masks still read
+  bit 0; no product reductions; sections that span blocks.
+- **Corpus** (before = 7b head, after = 7c):
+
+  | | IR | structure before | structure after | SPIR-V valid before | after |
+  |---|---|---|---|---|---|
+  | all | 19066 | 10328 | **13321** (19058 ignoring cross-lane) | 2843 | **3492** |
+  | cs | 2718 | 1086 | 1124 | 275 | 279 |
+  | mesh | 6681 | 5158 | 5236 | 0 | 0 (all stop at `s_load`, chunk 9) |
+  | ps | 8517 | 2985 | 5862 | 2020 | 2665 |
+  | vs | 1150 | 1099 | 1099 | 548 | 548 |
+
+  Cross-lane uses left, by programs: `v_readfirstlane` of a value not proved uniform and in no
+  waterfall (ps 2652, cs 1447, mesh 1445), `v_mov_b32` reading a mask (cs 666, ps 578; seen:
+  a scalar `s_cselect -1, 0` moved to a VGPR), `v_readlane` (ps 221, cs 201), unmodelled
+  sections (`v_permlanex16` ps 148, cs 88), `s_ff1` read as data (cs 236, ps 79).
+- **Split form**: not decided. The largest blocker is `v_readfirstlane`, which items 1-8 leave
+  refused when uniformity is not proved; sampled cases are a loop counter or a scalar copied
+  into a VGPR and merged under lane-wise flow, so a sharper uniformity (or a host-wide
+  broadcast-first with the `WaveReadLaneFirst` meaning) should be measured before XCL's split
+  form.
+
 ## Inputs and outputs
 
 **User SGPRs.** A VS/PS/CS receives user-data dword i in `s[i]`; merged stages and mesh have 8
