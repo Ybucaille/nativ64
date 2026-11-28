@@ -14,6 +14,7 @@
 
 use super::draw::ClearValue;
 use super::format::{self, FormatInfo};
+use super::imgheap::{ImageHeap, ImageMem};
 use super::textures::TexState;
 use super::{log_once, vk_try, Gpu, Result, VkError};
 use crate::d3d12::command::{Command, CopyLocation, Rect};
@@ -38,7 +39,7 @@ const TEXTURE3D: u32 = 4;
 /// A device-local image standing for one title resource.
 pub(super) struct TitleImage {
     pub(super) image: vk::Image,
-    pub(super) memory: vk::DeviceMemory,
+    pub(super) memory: ImageMem,
     pub(super) desc: ResourceDesc,
     pub(super) info: FormatInfo,
     /// The title memory the resource covers (its GPU address).
@@ -210,6 +211,8 @@ pub struct VkBackend<'g> {
     /// Images of placed views (memory with a description, no resource), by address and
     /// description words.
     pub(super) placed: HashMap<super::textures::PlacedKey, Option<TitleImage>>,
+    /// The device memory of `images` and `placed`.
+    heap: ImageHeap,
     pub(super) tex: TexState,
     pub(super) draw: super::draw::DrawState<'g>,
     pub stats: ReplayStats,
@@ -359,6 +362,7 @@ impl<'g> VkBackend<'g> {
             dd: Default::default(),
             #[cfg(test)]
             budget: None,
+            heap: ImageHeap::default(),
             #[cfg(test)]
             trim_budget: None,
         }
@@ -648,9 +652,11 @@ impl<'g> VkBackend<'g> {
                 d.destroy_image(image, None);
                 return None;
             };
-            if d.bind_image_memory(image, memory, 0).is_err() {
-                d.free_memory(memory, None);
+            if d.bind_image_memory(image, memory.memory, memory.offset)
+                .is_err()
+            {
                 d.destroy_image(image, None);
+                self.heap.free(d, memory);
                 return None;
             }
             let b = [vk::ImageMemoryBarrier::default()
@@ -706,10 +712,10 @@ impl<'g> VkBackend<'g> {
     /// Device-local memory for an image, None when the device has none (or, in tests, when the
     /// budget is spent).
     fn allocate_image_memory(
-        &self,
+        &mut self,
         d: &Device,
         req: &vk::MemoryRequirements,
-    ) -> Option<vk::DeviceMemory> {
+    ) -> Option<ImageMem> {
         let _t = super::profile::exec_timer(super::profile::Exec::AllocNs);
         #[cfg(test)]
         if let Some(budget) = self.budget {
@@ -734,16 +740,7 @@ impl<'g> VkBackend<'g> {
             ));
             return None;
         };
-        // SAFETY: a plain allocation; the caller binds or frees it.
-        let r = unsafe {
-            d.allocate_memory(
-                &vk::MemoryAllocateInfo::default()
-                    .allocation_size(req.size)
-                    .memory_type_index(ty),
-                None,
-            )
-        };
-        match r {
+        match self.heap.alloc(d, ty, req) {
             Ok(m) => Some(m),
             Err(e) => {
                 log_once(format!(
@@ -799,12 +796,12 @@ impl<'g> VkBackend<'g> {
 
     /// # Safety
     /// The GPU no longer uses the image.
-    pub(super) unsafe fn destroy(&self, t: TitleImage) {
+    pub(super) unsafe fn destroy(&mut self, t: TitleImage) {
         for v in t.views.values() {
             self.gpu.device.destroy_image_view(*v, None);
         }
         self.gpu.device.destroy_image(t.image, None);
-        self.gpu.device.free_memory(t.memory, None);
+        self.heap.free(&self.gpu.device, t.memory);
     }
 
     /// Log (once per kind of command) that a command is not replayed, and count it.
@@ -1430,6 +1427,7 @@ impl Drop for VkBackend<'_> {
                     self.destroy(t);
                 }
             }
+            self.heap.destroy(&self.gpu.device);
             self.tex.ring.destroy(self.gpu);
             self.tex.destroy(&self.gpu.device);
         }

@@ -11,6 +11,7 @@ mod draw;
 mod format;
 mod gpumem;
 mod image;
+mod imgheap;
 mod inspect;
 mod instance;
 mod memory;
