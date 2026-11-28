@@ -54,6 +54,22 @@ it is not enough) before merging. A pull request that keeps it is closed.
   write our own tests for the same behaviours (error codes, edge cases). Do not copy
   their code: it is LGPL, which is not compatible with this project's license.
 
+## Sign off your commits (DCO)
+
+Every commit in a pull request carries a `Signed-off-by:` line with your name and email:
+
+```
+Signed-off-by: Your Name <you@example.com>
+```
+
+`git commit -s` adds it (`git rebase --signoff main` adds it to commits you already made).
+By signing off you certify the [Developer Certificate of Origin 1.1](https://developercertificate.org/):
+you wrote the change, or you have the right to submit it under this project's license, and
+you understand it is public and recorded. In practice: the code is yours (or an AI tool's
+output you reviewed), or it comes from a project whose license allows it, credited as
+above, and nothing in it was copied from GPL/LGPL, proprietary or leaked sources.
+CI checks that every commit of a pull request is signed off.
+
 ## Before opening a pull request
 
 ```bash
@@ -73,4 +89,4 @@ CI runs the same checks.
   inside its package, strings, resource names). When in doubt, describe it instead.
 
 By contributing, you agree that your work is licensed under MIT or Apache-2.0, like the
-rest of the project.
+rest of the project, and your sign-off records that agreement.

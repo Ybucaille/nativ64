@@ -1,6 +1,24 @@
 name: ci
 on: [push, pull_request]
 jobs:
+  dco:
+    # Pull requests only: every commit carries a Signed-off-by line (CONTRIBUTING.md).
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Every commit is signed off
+        run: |
+          missing=$(git log --format='%h %s%n%b%x00' --no-merges \
+            "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}" \
+            | python3 -I -c 'import sys; print("\n".join(c.strip().splitlines()[0] for c in sys.stdin.read().split("\0") if c.strip() and "\nSigned-off-by: " not in "\n"+c))')
+          if [ -n "$missing" ]; then
+            echo "::error::Commits without a Signed-off-by line (git rebase --signoff, see CONTRIBUTING.md):"
+            echo "$missing"
+            exit 1
+          fi
   check:
     runs-on: ubuntu-latest
     steps:

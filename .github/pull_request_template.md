@@ -32,3 +32,4 @@ Maintainers check the legal items for every pull request and will ask you to rem
 - [ ] I claimed this work on an issue first (or opened one)
 - [ ] AI use, if any, is mentioned above
 - [ ] Code taken from another open-source project is credited and its license allows it
+- [ ] Every commit is signed off (`git commit -s`): I certify the Developer Certificate of Origin (see `CONTRIBUTING.md`)
