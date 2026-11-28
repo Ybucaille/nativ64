@@ -213,8 +213,10 @@ fn map_physical(address: *mut c_void, n: usize, pages: *const usize) -> bool {
 
 /// Protection a new view at `base` takes: the reservation's, or read/write.
 fn view_protect(base: usize) -> u32 {
-    match nativ64::api_ms_win_core_memory::query(base) {
-        Ok(i) if i.allocation_protect != 0x01 && i.allocation_protect != 0 => i.allocation_protect,
+    // not `query`: it also measures the run of equal pages, a walk over the rest of the pool
+    // for every page mapped, with the pool lock held
+    match nativ64::api_ms_win_core_memory::allocation_protect(base) {
+        Some(p) if p != 0x01 && p != 0 => p,
         _ => 0x04,
     }
 }

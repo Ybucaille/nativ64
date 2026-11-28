@@ -536,6 +536,13 @@ pub fn has_uncommitted_page(addr: usize, size: usize) -> bool {
     first < last && !r.run_of(first).is_some_and(|(_, e)| last <= e)
 }
 
+/// The protection the allocation of the table holding `addr` was made with. Unlike [`query`]
+/// it reads no page state, so its cost does not follow the size of the allocation.
+pub fn allocation_protect(addr: usize) -> Option<u32> {
+    let t = table();
+    find(&t, addr & !(PAGE - 1)).map(|b| t.regions[&b].alloc_protect)
+}
+
 /// One host mapping from `/proc/self/maps`: start, end, readable, writable, executable.
 fn host_mapping(addr: usize) -> Option<(usize, usize, bool, bool, bool)> {
     let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
@@ -970,6 +977,7 @@ mod tests {
         assert_eq!(committed_run(a + 0x1ffff), whole);
         assert!(is_committed(a, 0x20000));
         assert!(!is_committed(a, 0x20001));
+        assert_eq!(allocation_protect(a + 0x1ffff), Some(RW));
         // decommit in the middle: two runs, then one again
         free(a + 0x8000, 0x1000, MEM_DECOMMIT).unwrap();
         assert_eq!(committed_run(a + 0x7fff), Some((a, a + 0x8000)));
@@ -998,6 +1006,7 @@ mod tests {
         release(a + 0x10000).unwrap();
         release(a + 0x18000).unwrap();
         assert_eq!(committed_run(a + 0x18000), None);
+        assert_eq!(allocation_protect(1), None);
     }
 
     #[test]
