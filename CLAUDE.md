@@ -1,5 +1,9 @@
 # nativ64
 
+**Contributors:** `HANDOFF.md` and `docs/journal/` are the maintainer's local working notes and are not in the
+repository. Work from `CONTRIBUTING.md`, the issue you took and the `docs/` page of the area you touch; ignore the rest
+of this file.
+
 Before resuming, read `HANDOFF.md` (state, rules, environment, next step): it is the reference.
 At each finished step: **rewrite** `HANDOFF.md` (current state + next step, under ~150 lines; do not add a session
 paragraph), write the session story at the end of `docs/journal/journal.md` (read only when needed), commit.
