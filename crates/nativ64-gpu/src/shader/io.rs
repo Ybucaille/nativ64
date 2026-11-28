@@ -467,13 +467,38 @@ pub fn refuse_entry(rec: &Record) -> Result<(), SpirvError> {
     }))
 }
 
+/// Refuses a program that needs more lanes in one subgroup than the host's `subgroup_size`
+/// (`docs/shaders.md`, Wave64 on narrower subgroups): one whose wave is wider and whose
+/// result depends on lanes outside the invocation's own subgroup.
+pub fn refuse_wave(
+    func: &ir::Func,
+    st: &structure::Structured,
+    subgroup_size: u32,
+) -> Result<(), SpirvError> {
+    let wave = if func.wave32 { 32 } else { 64 };
+    if subgroup_size >= wave {
+        return Ok(());
+    }
+    let Some(d) = structure::wave_dependence(func, st) else {
+        return Ok(());
+    };
+    Err(SpirvError::Unsupported(spirv::Unsupported {
+        chunk: 7,
+        op: format!(
+            "a wave{wave} program with {} (at +{:#x}) on subgroups of {subgroup_size}",
+            d.what, d.at
+        ),
+    }))
+}
+
 /// Translates one vertex, pixel or compute program to its entry point (`Vertex`, `Fragment`,
 /// `GLCompute`). `targets` are the DXGI formats of the render targets (pixel only; float where
-/// missing).
+/// missing). `subgroup_size` is the host's: see `refuse_wave`.
 pub fn translate_stage(
     p: &ParsedShader,
     targets: &[u32],
     link: Option<&Link>,
+    subgroup_size: u32,
 ) -> Result<Translated, StageError> {
     let rec = p.record().ok_or(StageError::NotAStage)?;
     let io = stage_io(p, targets, link).ok_or(StageError::NotAStage)?;
@@ -482,6 +507,7 @@ pub fn translate_stage(
     let regs = EntryRegs::from_stage(rec);
     let func = ir::build(&code, gfx10::ENTRY, rec.wave32(), &regs).map_err(StageError::Ir)?;
     let st = structure::structure(&func).map_err(StageError::Structure)?;
+    refuse_wave(&func, &st, subgroup_size).map_err(StageError::Spirv)?;
     spirv::translate_io(&func, &st, &io).map_err(StageError::Spirv)
 }
 
@@ -492,10 +518,11 @@ pub fn translate_pair(
     vs: &ParsedShader,
     ps: &ParsedShader,
     targets: &[u32],
+    subgroup_size: u32,
 ) -> Result<(Translated, Translated), StageError> {
     let l = link(vs, ps);
-    let mut v = translate_stage(vs, targets, Some(&l))?;
-    let mut p = translate_stage(ps, targets, Some(&l))?;
+    let mut v = translate_stage(vs, targets, Some(&l), subgroup_size)?;
+    let mut p = translate_stage(ps, targets, Some(&l), subgroup_size)?;
     let mut shared = v.samplers.clone();
     let renumber: Vec<u32> = p
         .samplers

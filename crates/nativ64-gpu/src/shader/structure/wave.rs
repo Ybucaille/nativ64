@@ -51,7 +51,7 @@ impl WaveOp {
     }
 
     /// Combining a lane with itself changes nothing.
-    fn idempotent(self) -> bool {
+    pub(super) fn idempotent(self) -> bool {
         !matches!(self, Self::IAdd | Self::FAdd | Self::Xor)
     }
 

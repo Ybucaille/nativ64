@@ -18,6 +18,9 @@
 use nativ64_gpu::shader::{self, gfx10};
 use std::process::ExitCode;
 
+/// The widest wave: the subgroup size under which no program is refused for its wave size.
+const WHOLE_WAVE: u32 = 64;
+
 fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let disasm = args.first().is_some_and(|a| a == "--disasm");
@@ -26,15 +29,24 @@ fn main() -> ExitCode {
     if args.first().is_some_and(|a| a == "--spirv") {
         args.remove(0);
         return match args.first().map(String::as_str) {
-            Some("--stats") => spirv_stats(&args[1..], false),
-            Some("--alu-stats") => spirv_stats(&args[1..], true),
+            Some("--stats") => match args.get(1).map(String::as_str) {
+                Some("--subgroup") => match args.get(2).and_then(|n| n.parse().ok()) {
+                    Some(n) => spirv_stats(&args[3..], false, n),
+                    None => {
+                        eprintln!("--subgroup needs a number of invocations");
+                        ExitCode::from(2)
+                    }
+                },
+                _ => spirv_stats(&args[1..], false, WHOLE_WAVE),
+            },
+            Some("--alu-stats") => spirv_stats(&args[1..], true, WHOLE_WAVE),
             Some("--pair") if args.len() == 5 && args[3] == "-o" => {
                 spirv_pair(&args[1], &args[2], &args[4])
             }
             Some(_) if args.len() == 3 && args[1] == "-o" => spirv_write(&args[0], &args[2]),
             _ => {
                 eprintln!(
-                    "usage: nativ64-shader --spirv (--stats | --alu-stats) <blob.dxbc>...\n       \
+                    "usage: nativ64-shader --spirv (--stats [--subgroup <n>] | --alu-stats) <blob.dxbc>...\n       \
                      nativ64-shader --spirv <blob.dxbc> -o <out.spv>\n       \
                      nativ64-shader --spirv --pair <vs.dxbc> <ps.dxbc> -o <out>\n       \
                      (a vertex or pixel blob is written as its stage's entry point; --pair \
@@ -740,7 +752,7 @@ fn spirv_write(blob: &str, out: &str) -> ExitCode {
         return ExitCode::FAILURE;
     };
     if let Some(io) = shader::io::stage_io(&p, &[], None) {
-        return match shader::io::translate_stage(&p, &[], None) {
+        return match shader::io::translate_stage(&p, &[], None, WHOLE_WAVE) {
             Ok(t) => write_words(&t.words, out, &io),
             Err(e) => {
                 eprintln!("{blob}: {e}");
@@ -815,7 +827,7 @@ fn spirv_pair(vs: &str, ps: &str, out: &str) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match shader::io::translate_pair(&vs, &ps, &[]) {
+    match shader::io::translate_pair(&vs, &ps, &[], WHOLE_WAVE) {
         Ok((v, p)) => {
             let l = shader::io::link(&vs, &ps);
             println!("link: {:?} / {:?}", l.params, l.attrs);
@@ -855,9 +867,11 @@ fn spirv_val(words: &[u32], scratch: &std::path::Path) -> Option<Result<(), Stri
 }
 
 /// `--spirv --stats`: per stage, the programs that structure, translate and validate, and the
-/// others by first unsupported op. `--spirv --alu-stats`: the programs whose every ALU
+/// others by first unsupported op. With `--subgroup <n>` the programs that need a wider
+/// subgroup than `n` (`io::refuse_wave`) count as refused, and each stage also reports the
+/// structured programs that depend on their wave size. `--spirv --alu-stats`: the programs whose every ALU
 /// instruction translates, and the unsupported ALU ops by number of programs.
-fn spirv_stats(files: &[String], alu_only: bool) -> ExitCode {
+fn spirv_stats(files: &[String], alu_only: bool, subgroup: u32) -> ExitCode {
     use shader::spirv::{alu, SpirvError};
     use shader::{ir, spirv, structure};
     use std::collections::{BTreeMap, BTreeSet};
@@ -865,6 +879,10 @@ fn spirv_stats(files: &[String], alu_only: bool) -> ExitCode {
         std::env::temp_dir().join(format!("nativ64-spirv-stats-{}.spv", std::process::id()));
     // per stage: programs with IR, structured, translated, validated
     let mut stage: BTreeMap<String, [u32; 4]> = BTreeMap::new();
+    // per stage: structured programs refused for their wave size, those of them that would
+    // translate and validate on a whole wave, and the dependence found
+    let mut narrow: BTreeMap<String, [u32; 2]> = BTreeMap::new();
+    let mut why: BTreeMap<(String, &str), u32> = BTreeMap::new();
     let mut first: BTreeMap<(String, u8, String), u32> = BTreeMap::new();
     let mut other: BTreeMap<String, u32> = BTreeMap::new();
     let mut invalid: Vec<(u64, String)> = Vec::new();
@@ -927,6 +945,13 @@ fn spirv_stats(files: &[String], alu_only: bool) -> ExitCode {
                 continue;
             };
             e[1] += 1;
+            let refused = shader::io::refuse_wave(&func, &st, subgroup).is_err();
+            if refused {
+                narrow.entry(name.to_string()).or_default()[0] += 1;
+                if let Some(d) = structure::wave_dependence(&func, &st) {
+                    *why.entry((name.to_string(), d.what)).or_default() += 1;
+                }
+            }
             let built = match &io {
                 Some(io) => shader::io::refuse_entry(rec)
                     .and_then(|()| spirv::translate_io(&func, &st, io))
@@ -934,6 +959,11 @@ fn spirv_stats(files: &[String], alu_only: bool) -> ExitCode {
                 None => spirv::translate(&func, &st).map(|p| p.words),
             };
             match built {
+                Ok(words) if refused => {
+                    if matches!(spirv_val(&words, &scratch), Some(Ok(()))) {
+                        narrow.entry(name.to_string()).or_default()[1] += 1;
+                    }
+                }
                 Ok(words) => {
                     e[2] += 1;
                     match spirv_val(&words, &scratch) {
@@ -945,6 +975,8 @@ fn spirv_stats(files: &[String], alu_only: bool) -> ExitCode {
                         None => no_val = true,
                     }
                 }
+                // refused for the wave size anyway: counted above
+                Err(_) if refused => {}
                 Err(SpirvError::Unsupported(u)) => {
                     *first.entry((name.to_string(), u.chunk, u.op)).or_default() += 1;
                 }
@@ -999,6 +1031,19 @@ fn spirv_stats(files: &[String], alu_only: bool) -> ExitCode {
             "  {s}: {} IR, {} structured, {} translated, {} validated",
             v[0], v[1], v[2], v[3]
         );
+    }
+    if subgroup < WHOLE_WAVE {
+        println!("refused for their wave size on subgroups of {subgroup}:");
+        for (s, v) in &narrow {
+            println!(
+                "  {s}: {} structured, {} of them valid on a whole wave",
+                v[0], v[1]
+            );
+        }
+        println!("first dependence of those:");
+        for ((s, what), n) in &why {
+            println!("{n:6}  {s}: {what}");
+        }
     }
     println!("first unsupported op of the structured programs:");
     let v = first

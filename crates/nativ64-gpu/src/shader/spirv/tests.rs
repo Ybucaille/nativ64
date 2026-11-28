@@ -2822,7 +2822,7 @@ pub(crate) mod stage {
     }
 
     fn translate_full(p: &ParsedShader, link: Option<&Link>) -> Translated {
-        let t = io::translate_stage(p, &[], link).unwrap_or_else(|e| panic!("{e}"));
+        let t = io::translate_stage(p, &[], link, 64).unwrap_or_else(|e| panic!("{e}"));
         validate(&t.words);
         t
     }
@@ -2882,7 +2882,7 @@ pub(crate) mod stage {
     #[test]
     fn barycentrics_used_other_than_by_interp_are_refused() {
         let p = ps_blob(0x2, &["v_add_f32 v8, v0, v1"]);
-        match io::translate_stage(&p, &[], None) {
+        match io::translate_stage(&p, &[], None, 64) {
             Err(io::StageError::Spirv(SpirvError::Unsupported(u))) => assert_eq!(u.chunk, 8),
             r => panic!("{:?}", r.map(|t| t.words.len())),
         }
@@ -2901,7 +2901,7 @@ pub(crate) mod stage {
                 .into_iter()
                 .collect()
         );
-        let (v, p) = io::translate_pair(&vs, &ps, &[]).unwrap();
+        let (v, p) = io::translate_pair(&vs, &ps, &[], 64).unwrap();
         let (v, p) = (v.words, p.words);
         validate(&v);
         validate(&p);
@@ -2963,7 +2963,7 @@ pub(crate) mod stage {
 
     /// The `(chunk, op)` a stage is refused with.
     fn refused(p: &ParsedShader) -> (u8, String) {
-        match io::translate_stage(p, &[], None) {
+        match io::translate_stage(p, &[], None, 64) {
             Err(io::StageError::Spirv(SpirvError::Unsupported(u))) => (u.chunk, u.op),
             r => panic!("{:?}", r.map(|t| t.words.len())),
         }
@@ -3245,7 +3245,7 @@ pub(crate) mod stage {
         let ps = ps_tables(&ps_after(&TEX_CONST_SAMPLER, &[SAMPLE_2D]));
         // different samplers: the VS's is binding 0, the PS's is renumbered to 1
         let vs = vs_with_sampler("s_movk_i32 s12, 0x500");
-        let (v, p) = io::translate_pair(&vs, &ps, &[]).unwrap();
+        let (v, p) = io::translate_pair(&vs, &ps, &[], 64).unwrap();
         assert_eq!(v.samplers.len(), 2);
         assert_eq!(p.samplers, v.samplers);
         assert_eq!(
@@ -3263,7 +3263,7 @@ pub(crate) mod stage {
         );
         // the same sampler in both: one entry, no renumbering
         let vs = vs_with_sampler("s_movk_i32 s12, 0x400");
-        let (v, p) = io::translate_pair(&vs, &ps, &[]).unwrap();
+        let (v, p) = io::translate_pair(&vs, &ps, &[], 64).unwrap();
         assert_eq!(v.samplers.len(), 1);
         assert_eq!(p.samplers, v.samplers);
         assert_eq!(count(&p.words, BINDING, &[0]), 2);
@@ -3478,7 +3478,7 @@ pub(crate) mod stage {
     }
 
     fn refused_cs(p: &ParsedShader) -> (u8, String) {
-        match io::translate_stage(p, &[], None) {
+        match io::translate_stage(p, &[], None, 64) {
             Err(io::StageError::Spirv(SpirvError::Unsupported(u))) => (u.chunk, u.op),
             r => panic!("{:?}", r.map(|t| t.words.len())),
         }
@@ -4066,6 +4066,94 @@ fn host_lane_numbers_are_refused_beside_a_console_lane_index() {
         ]),
         "v_mbcnt_lo_u32_b32"
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// Wave-size dependence: what a host with subgroups narrower than the wave refuses
+
+/// The refusal of `fun` on subgroups of `size`, if any.
+fn narrow(fun: &Func, size: u32) -> Option<String> {
+    let s = structure(fun).unwrap_or_else(|e| panic!("{e}"));
+    crate::shader::io::refuse_wave(fun, &s, size)
+        .err()
+        .map(|e| e.to_string())
+}
+
+#[test]
+fn a_wave_dependent_program_needs_subgroups_as_wide_as_its_wave() {
+    let wave64 = func(&[
+        "[w64] v_cmp_lt_u32_e32 vcc, 3, v0",
+        "[w64] s_bcnt1_i32_b64 s4, vcc",
+    ]);
+    let e = narrow(&wave64, 32).unwrap();
+    assert!(e.contains("wave64") && e.contains("lane count"), "{e}");
+    assert_eq!(narrow(&wave64, 64), None);
+
+    let sum = func(&[&SUM_SECTION[..], &["v_mov_b32_e32 v3, v1"]].concat());
+    assert!(narrow(&sum, 16).unwrap().contains("prefix scan"));
+    assert_eq!(narrow(&sum, 32), None);
+
+    for (lines, what) in [
+        (
+            [
+                "v_cmp_lt_u32_e32 vcc_lo, 3, v0",
+                "s_ff1_i32_b32 s5, vcc_lo",
+                "v_readlane_b32 s6, v0, s5",
+            ],
+            "first lane",
+        ),
+        (
+            [
+                "v_cmp_lt_u32_e32 vcc_lo, 3, v0",
+                "v_mbcnt_lo_u32_b32 v3, vcc_lo, 0",
+                "v_mov_b32_e32 v4, s6",
+            ],
+            "rank",
+        ),
+        (
+            [
+                "v_cmp_lt_u32_e32 vcc_lo, 3, v0",
+                "s_cmp_lg_u32 vcc_lo, 0",
+                "s_cselect_b32 s7, 1, 0",
+            ],
+            "vote",
+        ),
+    ] {
+        let e = narrow(&func(&lines), 8).unwrap();
+        assert!(e.contains(what), "{what}: {e}");
+    }
+    // the speculated region's `Any`
+    let speculated = words(&SPECULATED);
+    assert!(narrow(&speculated, 8).unwrap().contains("wave-wide branch"));
+    assert_eq!(narrow(&speculated, 64), None);
+}
+
+#[test]
+fn quads_own_lanes_and_uniform_values_run_on_any_subgroup_size() {
+    // the maximum of one value every lane holds
+    let max: Vec<String> = SUM_SECTION
+        .iter()
+        .map(|l| {
+            if l.starts_with("v_cndmask") {
+                "v_mov_b32_e32 v1, s0".to_string()
+            } else {
+                l.replace("v_add_nc_u32_e32", "v_max_u32_e32")
+            }
+        })
+        .chain(["v_mov_b32_e32 v4, s6".to_string()])
+        .collect();
+    let max: Vec<&str> = max.iter().map(String::as_str).collect();
+    let programs: [&[&str]; 4] = [
+        &["ds_swizzle_b32 v1, v0 offset:swizzle(QUAD_PERM,1,0,3,2)"],
+        &["[w64] v_mov_b32 v9, s0", "[w64] v_readfirstlane_b32 s5, v9"],
+        // EXEC at entry holds every lane
+        &["s_cmp_lg_u32 exec_lo, 0", "s_cselect_b32 s7, 1, 0"],
+        &max,
+    ];
+    for lines in programs {
+        let (fun, _) = wave_ok(lines);
+        assert_eq!(narrow(&fun, 4), None, "{lines:?}");
+    }
 }
 
 // ---------------------------------------------------------------------------------------

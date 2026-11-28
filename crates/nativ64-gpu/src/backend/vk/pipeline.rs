@@ -69,8 +69,9 @@ pub enum Outcome {
 
 pub struct Pipelines<'g> {
     gpu: &'g Gpu,
-    /// By serial and whether the pipeline is the rectangle-list variant (it has a geometry stage).
-    map: HashMap<(u64, bool, Vec<u32>), Outcome>,
+    /// By serial, whether the pipeline is the rectangle-list variant (it has a geometry stage),
+    /// the replaced target formats and the subgroup size the stages are translated for.
+    map: HashMap<(u64, bool, Vec<u32>, u32), Outcome>,
 }
 
 impl<'g> Pipelines<'g> {
@@ -95,7 +96,7 @@ impl<'g> Pipelines<'g> {
         formats: &[u32],
     ) -> &Outcome {
         let gpu = self.gpu;
-        let key = (pd.serial, rect, formats.to_vec());
+        let key = (pd.serial, rect, formats.to_vec(), gpu.subgroups.size);
         self.map.entry(key).or_insert_with(|| {
             let _step = profile::step(profile::Step::Pipeline);
             let t0 = std::time::Instant::now();
@@ -472,12 +473,12 @@ fn build(
     }
     let (mut tv, mut tp) = match &ps {
         Some(ps) => {
-            let (a, b) =
-                io::translate_pair(&vs, ps, &g.target_formats).map_err(|e| e.to_string())?;
+            let (a, b) = io::translate_pair(&vs, ps, &g.target_formats, gpu.subgroups.size)
+                .map_err(|e| e.to_string())?;
             (a, Some(b))
         }
         None => (
-            io::translate_stage(&vs, &[], None).map_err(|e| e.to_string())?,
+            io::translate_stage(&vs, &[], None, gpu.subgroups.size).map_err(|e| e.to_string())?,
             None,
         ),
     };
@@ -742,7 +743,8 @@ fn build_compute(
         None => {
             let bytes = stage(pd, "compute").ok_or("no compute stage")?;
             let cs = parse_stage(bytes, "compute")?;
-            let t = io::translate_stage(&cs, &[], None).map_err(|e| e.to_string())?;
+            let t = io::translate_stage(&cs, &[], None, gpu.subgroups.size)
+                .map_err(|e| e.to_string())?;
             if t.memory_addresses {
                 return Err("a stage that reads memory through an address it loaded".into());
             }

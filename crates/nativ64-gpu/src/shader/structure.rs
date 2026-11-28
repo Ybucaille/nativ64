@@ -21,8 +21,10 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 
+mod dependence;
 mod uniform;
 mod wave;
+pub use dependence::{wave_dependence, WaveDependence};
 use uniform::narrows;
 pub use uniform::{Dom, LaneUse};
 pub use wave::{Scan, WaveOp};
