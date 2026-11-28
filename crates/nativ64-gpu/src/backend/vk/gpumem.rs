@@ -48,6 +48,46 @@ pub struct Mapped {
     pub address: vk::DeviceAddress,
 }
 
+/// The most `prepare` merges into one import: windows that only touch (no overlap) stop
+/// merging there. Overlapping windows (an access running past its window) always merge.
+const MERGE_CAP: usize = WINDOW;
+
+/// A window a miss imports, with the aligned run it lies in (windows of different runs never
+/// merge).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Need {
+    start: usize,
+    end: usize,
+    run: (usize, usize),
+}
+
+/// `va..va+len` (at least 1 byte) as host addresses.
+fn bounds(va: u64, len: u64) -> Option<(usize, usize)> {
+    let at = usize::try_from(va).ok()?;
+    let end = at.checked_add(usize::try_from(len.max(1)).ok()?)?;
+    Some((at, end))
+}
+
+/// The imports covering `needs`: per run, windows that overlap merge, and windows that touch
+/// merge while the result stays within `cap` bytes.
+fn coalesce(mut needs: Vec<Need>, cap: usize) -> Vec<(usize, usize)> {
+    needs.sort_unstable_by_key(|n| (n.run, n.start, n.end));
+    let mut out: Vec<Need> = Vec::new();
+    for n in needs {
+        if let Some(last) = out.last_mut() {
+            let merged_end = last.end.max(n.end);
+            if last.run == n.run
+                && (n.start < last.end || (n.start == last.end && merged_end - last.start <= cap))
+            {
+                last.end = merged_end;
+                continue;
+            }
+        }
+        out.push(n);
+    }
+    out.into_iter().map(|n| (n.start, n.end)).collect()
+}
+
 struct Import<'g> {
     end: usize,
     buffer: HostBuffer<'g>,
@@ -196,21 +236,66 @@ impl<'g> GpuMemory<'g> {
     /// on first use; None when the address is not memory we can import, or the range runs out
     /// of what is imported.
     pub fn translate(&mut self, va: u64, len: u64) -> Option<Mapped> {
-        let at = usize::try_from(va).ok()?;
-        let end = at.checked_add(usize::try_from(len.max(1)).ok()?)?;
-        if let Some((&start, i)) = self.imports.range_mut(..=at).next_back() {
-            if at < i.end && end <= i.end {
-                i.used = self.epoch;
-                return Some(Self::mapped(start, i, at));
-            }
+        let (at, end) = bounds(va, len)?;
+        if let Some(m) = self.hit(at, end) {
+            return Some(m);
         }
+        let need = self.plan(at, end)?;
+        self.import(need.start, need.end)?;
+        self.hit(at, end)
+    }
+
+    /// Imports, ahead of the `translate` calls that will follow, what the accesses `(va, len)`
+    /// not yet imported need, the windows of a run that touch or overlap merged into one
+    /// import of at most `MERGE_CAP` bytes: many small accesses over a pool (one
+    /// `POOL_WINDOW` window each) then cost one driver call instead of one each, and only the
+    /// windows they read are pinned, as before. What fails to import here is tried again, a
+    /// window at a time, by `translate`.
+    pub fn prepare(&mut self, accesses: &[(u64, u64)]) {
+        let needs: Vec<Need> = accesses
+            .iter()
+            .filter_map(|&(va, len)| {
+                let (at, end) = bounds(va, len)?;
+                if self.hit_quiet(at, end) {
+                    return None;
+                }
+                self.plan(at, end)
+            })
+            .collect();
+        for (start, end) in coalesce(needs, MERGE_CAP) {
+            self.import(start, end);
+        }
+    }
+
+    /// The import holding `at..end`, marked used.
+    fn hit(&mut self, at: usize, end: usize) -> Option<Mapped> {
+        let (&start, i) = self.imports.range_mut(..=at).next_back()?;
+        if at < i.end && end <= i.end {
+            i.used = self.epoch;
+            return Some(Self::mapped(start, i, at));
+        }
+        None
+    }
+
+    /// Whether an import holds `at..end` (not marked used).
+    fn hit_quiet(&self, at: usize, end: usize) -> bool {
+        self.imports
+            .range(..=at)
+            .next_back()
+            .is_some_and(|(_, i)| at < i.end && end <= i.end)
+    }
+
+    /// The window a miss on `at..end` imports; None (logged) when the access does not fit an
+    /// import of its run.
+    fn plan(&self, at: usize, end: usize) -> Option<Need> {
         let (start, run_end) = self.run_around(at)?;
         let align = self.gpu.import_alignment().max(1);
         let (start, run_end) = (start.next_multiple_of(align), run_end / align * align);
         if !(start <= at && end <= run_end) {
             log_once(format!(
-                "GPU memory: {va:#x} (+{len:#x}) does not fit an import of {start:#x}..{run_end:#x} \
-                 (alignment {align:#x})"
+                "GPU memory: {at:#x} (+{:#x}) does not fit an import of {start:#x}..{run_end:#x} \
+                 (alignment {align:#x})",
+                end - at
             ));
             return None;
         }
@@ -222,18 +307,23 @@ impl<'g> GpuMemory<'g> {
             WINDOW
         }
         .next_multiple_of(align);
+        let run = (start, run_end);
         let start = start + (at - start) / window * window;
-        let run_end = run_end.min((start + window).max(end.next_multiple_of(align)));
-        // Imports overlapping the window (too small, or the run grew): replaced by it.
+        let end = run_end.min((start + window).max(end.next_multiple_of(align)));
+        Some(Need { start, end, run })
+    }
+
+    /// Imports `start..end`, replacing the imports overlapping it (too small, or the run grew).
+    fn import(&mut self, start: usize, end: usize) -> Option<()> {
         let old: Vec<usize> = self
             .imports
-            .range(..run_end)
+            .range(..end)
             .filter(|(_, i)| i.end > start)
             .map(|(&s, _)| s)
             .collect();
         let ti = profile::start();
         let t0 = std::time::Instant::now();
-        let imported = self.gpu.import_host(start as *mut u8, run_end - start);
+        let imported = self.gpu.import_host(start as *mut u8, end - start);
         profile::stop(profile::Phase::Import, ti);
         profile::count(profile::Count::Imports, 1);
         profile::exec_since(profile::Exec::ImportNs, t0);
@@ -242,7 +332,7 @@ impl<'g> GpuMemory<'g> {
             Ok(b) => b,
             Err(e) => {
                 log_once(format!(
-                    "GPU memory: cannot import {start:#x}..{run_end:#x}: {e}"
+                    "GPU memory: cannot import {start:#x}..{end:#x}: {e}"
                 ));
                 return None;
             }
@@ -254,19 +344,20 @@ impl<'g> GpuMemory<'g> {
             ));
             return None;
         }
-        let import = Import {
-            end: run_end,
-            buffer,
-            used: self.epoch,
-        };
-        let m = Self::mapped(start, &import, at);
         for s in old {
             if let Some(i) = self.imports.remove(&s) {
                 self.retired.push(i);
             }
         }
-        self.imports.insert(start, import);
-        Some(m)
+        self.imports.insert(
+            start,
+            Import {
+                end,
+                buffer,
+                used: self.epoch,
+            },
+        );
+        Some(())
     }
 
     /// The host range around `at` an import may cover: the committed run of the memory table,
@@ -405,6 +496,83 @@ mod tests {
         assert_eq!(m.imports(), 1);
         table::release(a).unwrap();
         m.sync();
+    }
+
+    #[test]
+    fn touching_windows_merge_up_to_the_cap_and_overlapping_ones_always() {
+        let w = POOL_WINDOW;
+        let run = (0, 64 * w);
+        let other = (64 * w, 128 * w);
+        let need = |start, end, run| Need { start, end, run };
+        let needs = vec![
+            need(2 * w, 3 * w, run),
+            need(0, w, run),
+            need(w, 2 * w, run),
+            // the same window twice
+            need(w, 2 * w, run),
+            // a gap, then a window and an access running past it into the next
+            need(5 * w, 6 * w, run),
+            need(6 * w, 7 * w + 8, run),
+            need(7 * w, 8 * w, run),
+            // touching, but in another run
+            need(64 * w, 65 * w, other),
+        ];
+        assert_eq!(
+            coalesce(needs.clone(), 3 * w),
+            vec![(0, 3 * w), (5 * w, 8 * w), (64 * w, 65 * w)]
+        );
+        // a smaller cap stops touching windows, never overlapping ones
+        assert_eq!(
+            coalesce(needs, 2 * w),
+            vec![
+                (0, 2 * w),
+                (2 * w, 3 * w),
+                (5 * w, 6 * w),
+                (6 * w, 8 * w),
+                (64 * w, 65 * w)
+            ]
+        );
+        assert!(coalesce(Vec::new(), w).is_empty());
+    }
+
+    #[test]
+    fn prepared_pool_windows_are_one_import() {
+        let _changes = crate::backend::vk::tests::gpu_changes_lock();
+        use crate::xmem::*;
+        let Some(g) = gpu_or_skip() else { return };
+        let mut m = GpuMemory::new(&g);
+        let n = 64; // 4 MiB of pool pages: 16 windows
+        let mut count = n;
+        let mut pages = vec![0usize; n];
+        // SAFETY: the console calls on a fresh reservation and pages of the pool.
+        let base = unsafe {
+            let base = XMemVirtualAlloc(std::ptr::null_mut(), n << 16, 0x2000, 3, RW);
+            assert_eq!(
+                XMemAllocatePhysicalPages(0, &mut count, pages.as_mut_ptr()),
+                1
+            );
+            assert_eq!(XMemMapPhysicalPages(base, n, pages.as_ptr()), base);
+            base as usize
+        } as u64;
+        let w = POOL_WINDOW as u64;
+        // windows 0, 1, 2 (touching), then 5: two imports
+        let accesses = [
+            (base + 8, 16),
+            (base + w + 8, 16),
+            (base + 2 * w, 4),
+            (base + 5 * w, 4),
+        ];
+        m.prepare(&accesses);
+        assert_eq!(m.imports(), 2);
+        let first = m.translate(base + 8, 16).unwrap();
+        let third = m.translate(base + 2 * w, 4).unwrap();
+        assert_eq!(first.buffer, third.buffer);
+        assert_eq!(third.address - first.address, 2 * w - 8);
+        assert!(m.translate(base + 5 * w, 4).is_some());
+        // what is imported already is not imported again
+        m.prepare(&accesses);
+        assert_eq!(m.imports(), 2);
+        assert_eq!(m.retired(), 0);
     }
 
     #[test]

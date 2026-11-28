@@ -638,14 +638,21 @@ impl<'g> ViewTable<'g> {
         let mut again = std::mem::take(&mut self.retry);
         again.sort_unstable();
         again.dedup();
-        for index in again {
-            let v = crate::d3d12::descriptor::view_at(index);
+        let views: Vec<(usize, Option<View>)> = again
+            .into_iter()
+            .map(|index| (index, crate::d3d12::descriptor::view_at(index)))
+            .chain(changed.into_iter().map(|(index, v)| (index as usize, v)))
+            .collect();
+        // their memory imported first, in as few imports as it allows
+        let accesses: Vec<(u64, u64)> = views
+            .iter()
+            .filter_map(|(_, v)| buffer_view(v.as_ref()?))
+            .map(|(_, address, size, _)| (address, size.max(1)))
+            .collect();
+        mem.prepare(&accesses);
+        for (index, v) in views {
             let rec = v.as_ref().map_or(Rec::None, |v| record_of(v, mem));
             self.put(index, rec);
-        }
-        for (index, v) in changed {
-            let rec = v.as_ref().map_or(Rec::None, |v| record_of(v, mem));
-            self.put(index as usize, rec);
         }
     }
 }
