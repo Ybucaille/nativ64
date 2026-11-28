@@ -3,11 +3,11 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use super::alu::{exec, Cpu, Ctx, Opd, Unsupported};
+use super::alu::{exec, Cpu, Ctx, Opd, Unsupported, Wave};
 use super::emit::{translate, Probe, SpirvError};
 use super::gpu::{self, Gpu, Run};
 use crate::shader::ir::{build, EntryRegs, Func, Reg, Src, Term, Val};
-use crate::shader::structure::{structure, BranchKind, Guard, LaneUse, Structured};
+use crate::shader::structure::{structure, BranchKind, Guard, LaneUse, Scan, Structured, WaveOp};
 
 // Test programs are `fixtures.txt`: `hex<TAB>text` pairs, the text being what
 // `llvm-mc -arch=amdgcn -mcpu=gfx1013 -mattr=+wavefrontsize32 -show-encoding` assembled to that
@@ -151,12 +151,12 @@ fn lane_inst(
         .iter()
         .map(|&(r, d)| Ok((r, rd(&st.env, d)?)))
         .collect::<Result<Vec<_>, SpirvError>>()?;
-    let mut wave = None;
+    let mut wave = Wave::None;
     match swap {
-        Some(Swap::Result(x)) => wave = Some(Opd::V(x)),
+        Some(Swap::Result(x)) => wave = Wave::Result(Opd::V(x)),
         Some(Swap::Source(x)) => {
             srcs[0][0] = Opd::V(x);
-            wave = Some(Opd::V(x));
+            wave = Wave::Source;
         }
         None => {}
     }
@@ -190,6 +190,35 @@ fn lane_inst(
         st.out.insert((*reg, s.masks.is_mask(*val)), as_u32(o));
     }
     Ok(())
+}
+
+fn identity(op: WaveOp) -> u32 {
+    match op {
+        WaveOp::IAdd | WaveOp::FAdd | WaveOp::UMax | WaveOp::Or | WaveOp::Xor => 0,
+        WaveOp::UMin | WaveOp::And => u32::MAX,
+        WaveOp::SMin => i32::MAX as u32,
+        WaveOp::SMax => i32::MIN as u32,
+        WaveOp::FMin => f32::INFINITY.to_bits(),
+        WaveOp::FMax => f32::NEG_INFINITY.to_bits(),
+    }
+}
+
+/// One step of a host's group operation.
+fn group_step(op: WaveOp, a: u32, b: u32) -> u32 {
+    let float = |f: fn(f32, f32) -> f32| f(f32::from_bits(a), f32::from_bits(b)).to_bits();
+    match op {
+        WaveOp::IAdd => a.wrapping_add(b),
+        WaveOp::FAdd => float(|x, y| x + y),
+        WaveOp::UMin => a.min(b),
+        WaveOp::UMax => a.max(b),
+        WaveOp::SMin => (a as i32).min(b as i32) as u32,
+        WaveOp::SMax => (a as i32).max(b as i32) as u32,
+        WaveOp::FMin => float(f32::min),
+        WaveOp::FMax => float(f32::max),
+        WaveOp::And => a & b,
+        WaveOp::Or => a | b,
+        WaveOp::Xor => a ^ b,
+    }
 }
 
 /// The program on every lane of a wave at once, in lock step (every lane takes the same path:
@@ -240,6 +269,34 @@ fn interp_wave(
             let at = (cb, k);
             let use_ = s.masks.lanes.get(&i.instr.at).copied();
             match use_ {
+                // only the section's results are computed; the rest holds nothing
+                Some(LaneUse::WaveSkip) => {
+                    for st in &mut sts {
+                        for &(_, v) in &i.dsts {
+                            st.env.insert(v, Opd::V(0));
+                        }
+                    }
+                }
+                Some(LaneUse::WaveOut { op, scan, leaf }) => {
+                    let xs: Vec<u32> = sts
+                        .iter()
+                        .map(|st| rd(&st.env, Src::Val(leaf)).map(as_u32))
+                        .collect::<Result<_, _>>()?;
+                    let (reg, val) = i.dsts[0];
+                    for (n, st) in sts.iter_mut().enumerate() {
+                        let g0 = n / host * host;
+                        let end = match scan {
+                            Scan::Reduce => (g0 + host).min(xs.len()),
+                            Scan::Inclusive => n + 1,
+                            Scan::Exclusive => n,
+                        };
+                        let r = xs[g0..end]
+                            .iter()
+                            .fold(identity(op), |a, &b| group_step(op, a, b));
+                        st.env.insert(val, Opd::V(r));
+                        st.out.insert((reg, false), r);
+                    }
+                }
                 Some(LaneUse::Quad { sel }) => {
                     let xs: Vec<u32> = sts
                         .iter()
@@ -2227,7 +2284,7 @@ fn a_probe_has_no_lane_index_in_a_vertex_or_pixel_program() {
         dst_mask: vec![false],
         active: None,
         lane: None,
-        wave: None,
+        wave: Wave::None,
     };
     match exec(&mut Cpu, &ctx) {
         Err(Unsupported { chunk: 7, op }) => assert!(op.contains("lane index"), "{op}"),
@@ -3895,4 +3952,72 @@ fn a_mask_compared_with_zero_or_another_mask_is_a_vote() {
     ];
     assert_eq!(flag(&same, 8, 4, |_| 9), vec![1; 8]);
     assert_eq!(flag(&same, 8, 4, |l| l), [vec![0; 4], vec![1; 4]].concat());
+}
+
+/// A wave32 sum the way a compiler lowers it: set the inactive lanes to 0, prefix inside the
+/// rows of 16 by DPP shifts, carry row 0's total into row 1 by `v_permlanex16`, read lane 31.
+const SUM_SECTION: [&str; 18] = [
+    "v_cmp_lt_u32_e32 vcc_lo, 3, v0",
+    "s_and_saveexec_b32 s3, vcc_lo",
+    "s_or_saveexec_b32 s4, -1",
+    "v_cndmask_b32_e64 v1, 0, v0, s4",
+    "v_mov_b32_dpp v2, v1 row_shr:1 row_mask:0xf bank_mask:0xf bound_ctrl:1",
+    "v_add_nc_u32_e32 v1, v1, v2",
+    "v_mov_b32_dpp v2, v1 row_shr:2 row_mask:0xf bank_mask:0xf bound_ctrl:1",
+    "v_add_nc_u32_e32 v1, v1, v2",
+    "v_mov_b32_dpp v2, v1 row_shr:4 row_mask:0xf bank_mask:0xf bound_ctrl:1",
+    "v_add_nc_u32_e32 v1, v1, v2",
+    "v_mov_b32_dpp v2, v1 row_shr:8 row_mask:0xf bank_mask:0xf bound_ctrl:1",
+    "v_add_nc_u32_e32 v1, v1, v2",
+    "v_permlanex16_b32 v2, v1, -1, -1",
+    "s_mov_b32 exec_lo, 0xffff0000",
+    "v_add_nc_u32_e32 v1, v1, v2",
+    "s_mov_b32 exec_lo, -1",
+    "v_readlane_b32 s6, v1, 31",
+    "s_mov_b32 exec_lo, s4",
+];
+
+#[test]
+fn a_whole_wave_section_becomes_a_scan_and_a_reduction() {
+    let mut lines = SUM_SECTION.to_vec();
+    lines.extend(["v_mov_b32_e32 v3, v1", "v_mov_b32_e32 v4, s6"]);
+    let (fun, s) = wave_ok(&lines);
+    let outs: Vec<Scan> = s
+        .masks
+        .lanes
+        .values()
+        .filter_map(|u| match u {
+            LaneUse::WaveOut { op, scan, .. } => {
+                assert_eq!(*op, WaveOp::IAdd);
+                Some(*scan)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(outs.len(), 2, "{outs:?}");
+    assert!(outs.contains(&Scan::Inclusive) && outs.contains(&Scan::Reduce));
+    module_of(&fun).unwrap();
+    // the lanes up to 3 are inactive: they add nothing and keep their v3
+    let value = |k: u32| if k > 3 { 100 + k } else { 0 };
+    for host in [8usize, 16, 32] {
+        let out = lock(&fun, &s, 32, host, |l| {
+            vec![(Reg::V(0), if l > 3 { 100 + l } else { l })]
+        });
+        for (n, o) in out.iter().enumerate().skip(4) {
+            let n = n as u32;
+            let g0 = n / host as u32 * host as u32;
+            let prefix: u32 = (g0..=n).map(value).sum();
+            let total: u32 = (g0..g0 + host as u32).map(value).sum();
+            assert_eq!(get(o, Reg::V(3)), prefix, "host {host} lane {n}");
+            assert_eq!(get(o, Reg::V(4)), total, "host {host} lane {n}");
+        }
+    }
+}
+
+#[test]
+fn a_whole_wave_section_the_simulation_does_not_model_is_refused() {
+    // a product of two lane-crossing values is no reduction the simulation knows
+    let mut lines = SUM_SECTION.to_vec();
+    lines.insert(13, "v_mul_lo_u32 v2, v1, v2");
+    assert_eq!(first_cross_lane(&lines), "v_mov_b32 (dpp)");
 }

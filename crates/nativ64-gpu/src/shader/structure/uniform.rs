@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use super::wave::{Scan, WaveOp};
 use super::{classify_branch, is_exec, post_idoms, takes_lane_mask, BranchKind, Masks};
 use crate::shader::gfx10::Enc;
 use crate::shader::ir::{BlockId, Func, Inst, Reg, Src, Term, Val, ValDef};
@@ -46,6 +47,12 @@ pub enum LaneUse {
     /// `s_cmp_eq/lg` of two lane masks: SCC is "every invocation has the same two bits" or
     /// its negation.
     MasksEqual { eq: bool },
+    /// An instruction of a whole-wave section that only feeds other instructions of it: the
+    /// emitter drops it (the section's result is a `WaveOut`).
+    WaveSkip,
+    /// The instruction of a whole-wave section that defines a value the program reads
+    /// afterwards: the reduction or prefix (`scan`) by `op` of `leaf` over the lanes.
+    WaveOut { op: WaveOp, scan: Scan, leaf: Val },
 }
 
 /// How many times each value is read, and how many of those reads are the lane operand of a

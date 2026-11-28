@@ -475,3 +475,17 @@ fa040206001b00ff	v_add_f32_dpp v1, v0, v2 quad_perm:[3,2,1,0] row_mask:0xf bank_
 6a8007bf	s_cmp_lg_u32 vcc_lo, 0
 6a7e06bf	s_cmp_eq_u32 vcc_lo, exec_lo
 81800785	s_cselect_b32 s7, 1, 0
+c13d84be	s_or_saveexec_b32 s4, -1
+010001d580001200	v_cndmask_b32_e64 v1, 0, v0, s4
+fa02047e011109ff	v_mov_b32_dpp v2, v1 row_shr:1 row_mask:0xf bank_mask:0xf bound_ctrl:1
+0105024a	v_add_nc_u32_e32 v1, v1, v2
+fa02047e011209ff	v_mov_b32_dpp v2, v1 row_shr:2 row_mask:0xf bank_mask:0xf bound_ctrl:1
+fa02047e011409ff	v_mov_b32_dpp v2, v1 row_shr:4 row_mask:0xf bank_mask:0xf bound_ctrl:1
+fa02047e011809ff	v_mov_b32_dpp v2, v1 row_shr:8 row_mask:0xf bank_mask:0xf bound_ctrl:1
+020078d701830503	v_permlanex16_b32 v2, v1, -1, -1
+ff03febe0000ffff	s_mov_b32 exec_lo, 0xffff0000
+c103febe	s_mov_b32 exec_lo, -1
+060060d7013f0102	v_readlane_b32 s6, v1, 31
+0403febe	s_mov_b32 exec_lo, s4
+0103067e	v_mov_b32_e32 v3, v1
+020069d501050202	v_mul_lo_u32 v2, v1, v2

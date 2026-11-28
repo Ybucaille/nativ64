@@ -22,8 +22,10 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 
 mod uniform;
+mod wave;
 use uniform::narrows;
 pub use uniform::{Dom, LaneUse};
+pub use wave::{Scan, WaveOp};
 
 use super::gfx10::{Enc, Instr, Operand};
 use super::ir::{dominators, BlockId, Func, Inst, Reg, Src, Term, Val, ValDef};
@@ -361,6 +363,10 @@ fn type_masks_with(f: &Func, seeds: &HashSet<Val>) -> Masks {
     m.uniform_vals = uniform::uniform_vals(f, &m);
     (m.slots, m.slot_masks) = uniform::slot_vgprs(f, &m);
     m.lanes = uniform::lane_uses(f, &m, &m.slots);
+    // a whole-wave section the simulation understands replaces what the instructions in it
+    // were taken for one by one
+    let sections = wave::sections(f);
+    m.lanes.extend(sections);
     for blk in &f.blocks {
         for inst in &blk.insts {
             if let Some(name) = cross_lane_use(&m, inst) {

@@ -17,12 +17,16 @@ use spirv::{
     MemoryModel, Op, StorageClass,
 };
 
-use super::alu::{self, Backend, Ctx, Cvt, FBin, FCmp, FUn, IBin, ICmp, IUn, Opd, Unsupported};
+use super::alu::{
+    self, Backend, Ctx, Cvt, FBin, FCmp, FUn, IBin, ICmp, IUn, Opd, Unsupported, Wave,
+};
 use super::builder::{inst, Module};
 use crate::shader::io::StageIo;
 use crate::shader::ir::{Func, Reg, Src, Term, Val};
 use crate::shader::resource::{SamplerDesc, Translated};
-use crate::shader::structure::{BrKind, BranchKind, Guard, LaneUse, Node, Structured, Target};
+use crate::shader::structure::{
+    BrKind, BranchKind, Guard, LaneUse, Node, Scan, Structured, Target, WaveOp,
+};
 
 /// Why a program does not translate.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -199,6 +203,41 @@ impl Gen {
         let t = self.t_u32();
         let scope = self.k(3);
         self.op(Op::GroupNonUniformBallotFindLSB, t, &[scope, b])
+    }
+
+    /// The reduction or scan (`scan`) of `a` by `op` over the invocations of the subgroup.
+    pub(super) fn group_op(&mut self, op: WaveOp, scan: Scan, a: u32) -> u32 {
+        self.m.capability(Capability::GroupNonUniformArithmetic);
+        self.wave = true;
+        let (code, float) = match op {
+            WaveOp::IAdd => (Op::GroupNonUniformIAdd, false),
+            WaveOp::FAdd => (Op::GroupNonUniformFAdd, true),
+            WaveOp::UMin => (Op::GroupNonUniformUMin, false),
+            WaveOp::UMax => (Op::GroupNonUniformUMax, false),
+            // the signed operations read their operands as signed whatever the type says
+            WaveOp::SMin => (Op::GroupNonUniformSMin, false),
+            WaveOp::SMax => (Op::GroupNonUniformSMax, false),
+            WaveOp::FMin => (Op::GroupNonUniformFMin, true),
+            WaveOp::FMax => (Op::GroupNonUniformFMax, true),
+            WaveOp::And => (Op::GroupNonUniformBitwiseAnd, false),
+            WaveOp::Or => (Op::GroupNonUniformBitwiseOr, false),
+            WaveOp::Xor => (Op::GroupNonUniformBitwiseXor, false),
+        };
+        // the group operation is a literal
+        let group = match scan {
+            Scan::Reduce => 0,
+            Scan::Inclusive => 1,
+            Scan::Exclusive => 2,
+        };
+        let a = if float { self.as_f32(a) } else { a };
+        let t = if float { self.t_f32() } else { self.t_u32() };
+        let scope = self.k(3);
+        let r = self.op(code, t, &[scope, group, a]);
+        if float {
+            self.as_bits(r)
+        } else {
+            r
+        }
     }
 
     /// The value `a` has in the invocation of host lane `lane`.
@@ -540,6 +579,9 @@ struct Tr<'a> {
     lane_ifs: u32,
     /// The scalar variable of each spill slot `(vgpr, lane)` (`LaneUse::Slot*`).
     slots: HashMap<(u16, u8), u32>,
+    /// The variable keeping each value a whole-wave section reduces (`LaneUse::WaveOut`), as
+    /// its definition left it: the section may reuse the register afterwards.
+    leaves: HashMap<Val, u32>,
     /// `SubgroupLocalInvocationId`, created on first use, and the interface variables the
     /// emitter itself adds.
     sg_id: Option<u32>,
@@ -647,6 +689,17 @@ fn build<'a>(f: &'a Func, s: &'a Structured, io: Option<&'a StageIo>) -> Result<
             });
         }
     }
+    let mut leaves: HashMap<Val, u32> = HashMap::new();
+    for u in s.masks.lanes.values() {
+        if let LaneUse::WaveOut { leaf, .. } = *u {
+            leaves.entry(leaf).or_insert_with(|| {
+                let v = g.m.global_var(pu, StorageClass::Private, Some(zero));
+                g.m.name(v, &format!("leaf_{}", leaf.0));
+                iface.push(v);
+                v
+            });
+        }
+    }
     let mut t = Tr {
         f,
         s,
@@ -660,6 +713,7 @@ fn build<'a>(f: &'a Func, s: &'a Structured, io: Option<&'a StageIo>) -> Result<
         stage,
         lane_ifs: 0,
         slots,
+        leaves,
         sg_id: None,
         extra_iface: Vec::new(),
     };
@@ -816,6 +870,15 @@ impl Tr<'_> {
             }
         };
         self.g.store(var, x);
+        if let Some(&keep) = self.leaves.get(&val) {
+            let x = if mask {
+                let (one, zero) = (self.g.k(1), self.g.k(0));
+                self.g.select(x, one, zero)
+            } else {
+                x
+            };
+            self.g.store(keep, x);
+        }
         Ok(())
     }
 
@@ -851,6 +914,16 @@ impl Tr<'_> {
                     self.write(reg, val, Opd::V(x))?;
                     continue;
                 }
+                Some(LaneUse::WaveSkip) => continue,
+                // every invocation that reached the section takes part: EXEC is all ones
+                Some(LaneUse::WaveOut { op, scan, leaf }) => {
+                    let tu = self.g.t_u32();
+                    let x = self.g.load(tu, self.leaves[&leaf]);
+                    let r = self.g.group_op(op, scan, x);
+                    let (reg, val) = i.dsts[0];
+                    self.write(reg, val, Opd::V(r))?;
+                    continue;
+                }
                 _ => {}
             }
             let lane = match lane_use {
@@ -865,7 +938,7 @@ impl Tr<'_> {
                 }
                 srcs.push(v);
             }
-            let mut wave = None;
+            let mut wave = Wave::None;
             if let Some(LaneUse::Quad { sel }) = lane_use {
                 let Some(&Opd::V(x)) = srcs.first().and_then(|s| s.first()) else {
                     return bad("a quad operation on something that is not a dword");
@@ -874,8 +947,10 @@ impl Tr<'_> {
                 if i.instr.dpp.is_some() {
                     // the table runs the instruction on the permuted source
                     srcs[0][0] = r;
+                    wave = Wave::Source;
+                } else {
+                    wave = Wave::Result(r);
                 }
-                wave = Some(r);
             }
             let dword = |s: &Vec<Vec<Opd<Gen>>>, k: usize| match s.get(k).and_then(|d| d.first()) {
                 Some(&Opd::V(x)) => Some(x),
@@ -894,7 +969,7 @@ impl Tr<'_> {
                             self.g.ibin(IBin::Add, rank, x)
                         }
                     };
-                    wave = Some(Opd::V(r));
+                    wave = Wave::Result(Opd::V(r));
                 }
                 Some(u @ (LaneUse::MaskZero { eq } | LaneUse::MasksEqual { eq })) => {
                     let (a, b) = (self.mask_bit(&srcs[0]), self.mask_bit(&srcs[1]));
@@ -909,19 +984,19 @@ impl Tr<'_> {
                         self.g.all(e)
                     };
                     let flag = if eq { same } else { self.g.bnot(same) };
-                    wave = Some(Opd::B(flag));
+                    wave = Wave::Result(Opd::B(flag));
                 }
                 Some(LaneUse::Rank { hi: true }) => {
                     let Some(x) = dword(&srcs, 1) else {
                         return bad("a mask count that does not start from a dword");
                     };
-                    wave = Some(Opd::V(x));
+                    wave = Wave::Result(Opd::V(x));
                 }
                 Some(LaneUse::ReadHostLane) => {
                     let (Some(x), Some(lane)) = (dword(&srcs, 0), dword(&srcs, 1)) else {
                         return bad("a readlane of something that is not a dword");
                     };
-                    wave = Some(Opd::V(self.g.shuffle(x, lane)));
+                    wave = Wave::Result(Opd::V(self.g.shuffle(x, lane)));
                 }
                 _ => {}
             }

@@ -177,10 +177,18 @@ pub struct Ctx<'a, K: Backend> {
     /// The console lane index of this invocation (`LocalInvocationIndex` modulo the wave
     /// size; 0 in the probe). `None` where a stage cannot tell it (vertex, pixel).
     pub lane: Option<K::V>,
-    /// What the caller computed across lanes for an instruction that crosses them (`LaneUse`):
-    /// the result itself (`ds_swizzle`, a ballot count), or, with DPP, the swapped source (the
-    /// caller has already put it in `srcs` and the table runs the instruction on it).
-    pub wave: Option<Opd<K>>,
+    /// What the caller computed across lanes for an instruction that crosses them (`LaneUse`).
+    pub wave: Wave<K>,
+}
+
+/// What the caller made of the lane-crossing part of an instruction.
+pub enum Wave<K: Backend> {
+    /// Nothing: the instruction is lane-local (or `exec` refuses it by name).
+    None,
+    /// The result itself (`ds_swizzle`, a ballot, a reduction).
+    Result(Opd<K>),
+    /// A DPP instruction whose source 0 the caller has already swapped in `srcs`.
+    Source,
 }
 
 /// The plan chunk an instruction that is not ALU belongs to, `None` for the ALU ones.
@@ -529,7 +537,9 @@ pub fn exec<K: Backend>(b: &mut K, c: &Ctx<K>) -> Result<Vec<Opd<K>>, Unsupporte
     let name = i.name();
     // The structurer only lets a `v_readfirstlane` through when its source is uniform: a copy.
     // The other wave instructions come with what the caller made of them (`Ctx::wave`).
-    if let Some(chunk) = non_alu_chunk(i).filter(|_| !is_wave_exempt(name) && c.wave.is_none()) {
+    if let Some(chunk) =
+        non_alu_chunk(i).filter(|_| !is_wave_exempt(name) && matches!(c.wave, Wave::None))
+    {
         return Err(Unsupported {
             chunk,
             op: name.to_string(),
@@ -554,11 +564,11 @@ pub fn exec<K: Backend>(b: &mut K, c: &Ctx<K>) -> Result<Vec<Opd<K>>, Unsupporte
     };
     let res = match c.wave {
         // a compare that only sets SCC: the value is the flag
-        Some(w) if i.dpp.is_none() && x.width() == 0 => Res {
+        Wave::Result(w) if x.width() == 0 => Res {
             data: vec![],
             scc: Some(x.as_v(w)),
         },
-        Some(w) if i.dpp.is_none() => {
+        Wave::Result(w) => {
             let scc = if x.writes_scc() { x.scc_nz(&[w]) } else { None };
             Res { data: vec![w], scc }
         }
@@ -2535,7 +2545,7 @@ pub fn supported(inst: &Inst) -> Result<(), Unsupported> {
         dst_mask: vec![false; inst.dsts.len()],
         active: None,
         lane: Some(()),
-        wave: None,
+        wave: Wave::None,
     };
     exec(&mut Dry, &ctx).map(|_| ())
 }
