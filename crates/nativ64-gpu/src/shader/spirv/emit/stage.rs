@@ -210,6 +210,64 @@ impl<'a> Tr<'a> {
         }
     }
 
+    /// `SubgroupLocalInvocationId`: the host lane, whose low two bits are the lane of the quad.
+    fn subgroup_id(&mut self) -> u32 {
+        let tu = self.g.t_u32();
+        let var = match self.sg_id {
+            Some(v) => v,
+            None => {
+                let p = self.g.t_ptr(StorageClass::Input, tu);
+                let v = self.g.m.global_var(p, StorageClass::Input, None);
+                self.g.m.decorate(
+                    v,
+                    Decoration::BuiltIn,
+                    &[BuiltIn::SubgroupLocalInvocationId as u32],
+                );
+                if matches!(self.stage.as_ref().map(|s| s.io), Some(StageIo::Pixel(_))) {
+                    self.g.m.decorate(v, Decoration::Flat, &[]);
+                }
+                self.extra_iface.push(v);
+                self.sg_id = Some(v);
+                v
+            }
+        };
+        self.g.load(tu, var)
+    }
+
+    /// Lane `k` of every quad reads the value of lane `sel[k]` of its quad.
+    pub(super) fn quad_perm(&mut self, a: u32, sel: [u8; 4]) -> u32 {
+        if sel.iter().all(|&s| s == sel[0]) {
+            return self.g.quad_broadcast(a, u32::from(sel[0]));
+        }
+        for (dir, swap) in [[1, 0, 3, 2], [2, 3, 0, 1], [3, 2, 1, 0]]
+            .iter()
+            .enumerate()
+        {
+            if sel == *swap {
+                return self.g.quad_swap(a, dir as u32);
+            }
+        }
+        let tu = self.g.t_u32();
+        let tb = self.g.t_bool();
+        let id = self.subgroup_id();
+        let three = self.g.k(3);
+        let q = self.g.op(Op::BitwiseAnd, tu, &[id, three]);
+        let mut cache: HashMap<u8, u32> = HashMap::new();
+        let mut pick = |t: &mut Self, j: u8| -> u32 {
+            *cache
+                .entry(j)
+                .or_insert_with(|| t.g.quad_broadcast(a, u32::from(j)))
+        };
+        let mut r = pick(self, sel[3]);
+        for k in (0..3).rev() {
+            let b = pick(self, sel[k]);
+            let kk = self.g.k(k as u32);
+            let is = self.g.op(Op::IEqual, tb, &[q, kk]);
+            r = self.g.select(is, b, r);
+        }
+        r
+    }
+
     pub(super) fn begin_stage(&mut self) -> R<()> {
         let io = self.io();
         let tu = self.g.t_u32();

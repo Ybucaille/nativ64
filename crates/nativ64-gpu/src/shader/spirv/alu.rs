@@ -177,6 +177,10 @@ pub struct Ctx<'a, K: Backend> {
     /// The console lane index of this invocation (`LocalInvocationIndex` modulo the wave
     /// size; 0 in the probe). `None` where a stage cannot tell it (vertex, pixel).
     pub lane: Option<K::V>,
+    /// What the caller computed across lanes for an instruction that crosses them (`LaneUse`):
+    /// the result itself (`ds_swizzle`, a ballot count), or, with DPP, the swapped source (the
+    /// caller has already put it in `srcs` and the table runs the instruction on it).
+    pub wave: Option<Opd<K>>,
 }
 
 /// The plan chunk an instruction that is not ALU belongs to, `None` for the ALU ones.
@@ -524,7 +528,8 @@ pub fn exec<K: Backend>(b: &mut K, c: &Ctx<K>) -> Result<Vec<Opd<K>>, Unsupporte
     let i = &c.inst.instr;
     let name = i.name();
     // The structurer only lets a `v_readfirstlane` through when its source is uniform: a copy.
-    if let Some(chunk) = non_alu_chunk(i).filter(|_| !is_wave_exempt(name)) {
+    // The other wave instructions come with what the caller made of them (`Ctx::wave`).
+    if let Some(chunk) = non_alu_chunk(i).filter(|_| !is_wave_exempt(name) && c.wave.is_none()) {
         return Err(Unsupported {
             chunk,
             op: name.to_string(),
@@ -547,7 +552,13 @@ pub fn exec<K: Backend>(b: &mut K, c: &Ctx<K>) -> Result<Vec<Opd<K>>, Unsupporte
         name,
         mods,
     };
-    let res = x.run()?;
+    let res = match c.wave {
+        Some(w) if i.dpp.is_none() => {
+            let scc = if x.writes_scc() { x.scc_nz(&[w]) } else { None };
+            Res { data: vec![w], scc }
+        }
+        _ => x.run()?,
+    };
     x.finish(res)
 }
 
@@ -2519,6 +2530,7 @@ pub fn supported(inst: &Inst) -> Result<(), Unsupported> {
         dst_mask: vec![false; inst.dsts.len()],
         active: None,
         lane: Some(()),
+        wave: None,
     };
     exec(&mut Dry, &ctx).map(|_| ())
 }

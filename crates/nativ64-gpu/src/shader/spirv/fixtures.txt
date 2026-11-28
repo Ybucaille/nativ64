@@ -438,3 +438,18 @@ bf00064c	v_sub_nc_u32 v3, 63, v0
 09031402	[w64] v_cndmask_b32 v10, v9, v1, vcc
 0204febe	[w64] s_mov_b64 exec, s[2:3]
 060060d7090b0102	[w64] v_readlane_b32 s6, v9, 5
+5580d4d800000001	ds_swizzle_b32 v1, v0 offset:swizzle(QUAD_PERM,1,1,1,1)
+b180d4d800000001	ds_swizzle_b32 v1, v0 offset:swizzle(QUAD_PERM,1,0,3,2)
+4480d4d800000001	ds_swizzle_b32 v1, v0 offset:swizzle(QUAD_PERM,0,1,0,1)
+1b80d4d800000001	ds_swizzle_b32 v1, v0 offset:swizzle(QUAD_PERM,3,2,1,0)
+a080d4d800000001	ds_swizzle_b32 v1, v0 offset:swizzle(QUAD_PERM,0,0,2,2)
+c003d4d800000001	ds_swizzle_b32 v1, v0 offset:swizzle(BITMASK_PERM,"11110")
+0002d4d800000001	ds_swizzle_b32 v1, v0 offset:swizzle(BITMASK_PERM,"10000")
+fa02027e00b100ff	v_mov_b32_dpp v1, v0 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+fa04020600aa00ff	v_add_f32_dpp v1, v0, v2 quad_perm:[2,2,2,2] row_mask:0xf bank_mask:0xf
+e902027e00c154de	v_mov_b32_dpp v1, v0 dpp8:[1,0,3,2,5,4,7,6]
+fa02027e00b1005f	v_mov_b32_dpp v1, v0 quad_perm:[1,0,3,2] row_mask:0x5 bank_mask:0xf
+fa02027e000101ff	v_mov_b32_dpp v1, v0 row_shl:1 row_mask:0xf bank_mask:0xf
+1f08d4d800000001	ds_swizzle_b32 v1, v0 offset:swizzle(BITMASK_PERM,"pppip")
+3c00d4d800000001	ds_swizzle_b32 v1, v0 offset:swizzle(BITMASK_PERM,"ppp01")
+fa040206001b00ff	v_add_f32_dpp v1, v0, v2 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf

@@ -25,6 +25,47 @@ pub enum LaneUse {
     SlotRead { vgpr: u16, lane: u8 },
     /// `v_mbcnt_lo(-1, x)` (`hi: false`) / `v_mbcnt_hi(-1, x)`: the console lane index.
     LaneIndex { hi: bool },
+    /// `ds_swizzle_b32` in quad mode, or a DPP `quad_perm` / `dpp8` that stays in the quad of
+    /// 4 lanes: lane `k` of each quad reads the source of lane `sel[k]`.
+    Quad { sel: [u8; 4] },
+}
+
+/// The quad permutation of a `ds_swizzle_b32` or a DPP instruction, when it stays inside the
+/// quad (the same on every quad, whatever the console lane of the quad).
+fn quad_sel(i: &crate::shader::gfx10::Instr) -> Option<[u8; 4]> {
+    use crate::shader::gfx10::DppKind;
+    let pick = |ctrl: u32| [0, 1, 2, 3].map(|k| (ctrl >> (2 * k) & 3) as u8);
+    if i.name() == "ds_swizzle_b32" {
+        let off = i.mem.offset as u32 & 0xffff;
+        if off & 0x8000 != 0 {
+            return Some(pick(off));
+        }
+        // bitmask mode within groups of 32: quad-local when the bits above the quad pass
+        // through untouched
+        let (and, or, xor) = (off & 31, off >> 5 & 31, off >> 10 & 31);
+        if and & 0x1c != 0x1c || (or | xor) & 0x1c != 0 {
+            return None;
+        }
+        return Some([0, 1, 2, 3].map(|k| (((k & and) | or) ^ xor) as u8 & 3));
+    }
+    let d = i.dpp.as_ref()?;
+    if !matches!(i.enc, Enc::Vop1 | Enc::Vop2) {
+        return None;
+    }
+    match d.kind {
+        DppKind::Dpp16 => {
+            // no per-row / per-bank disabling, no source modifiers
+            let plain = d.row_mask == 0xf
+                && d.bank_mask == 0xf
+                && !(d.src0_neg || d.src0_abs || d.src1_neg || d.src1_abs);
+            (plain && d.ctrl < 0x100).then(|| pick(u32::from(d.ctrl)))
+        }
+        DppKind::Dpp8 | DppKind::Dpp8Fi => {
+            // each quad of the group of 8 reads inside itself, the same way
+            let q = |h: usize| [0, 1, 2, 3].map(|k| d.sel[4 * h + k].wrapping_sub(4 * h as u8));
+            (q(0) == q(1) && q(0).iter().all(|&s| s < 4)).then(|| q(0))
+        }
+    }
 }
 
 /// `a` is `b` or narrows it (`Masks::within`).
@@ -375,6 +416,9 @@ pub(super) fn lane_use(
 ) -> Option<LaneUse> {
     let i = &inst.instr;
     let n = i.name();
+    if let Some(sel) = quad_sel(i) {
+        return Some(LaneUse::Quad { sel });
+    }
     if i.dpp.is_some() {
         return None;
     }

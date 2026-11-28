@@ -87,94 +87,186 @@ fn interp(f: &Func, s: &Structured, ins: &[(Reg, u32)]) -> Result<Out, SpirvErro
     interp_lane(f, s, ins, 0)
 }
 
-/// One console lane of the program: `lane` is its lane index (what `v_mbcnt(-1, .)` counts).
-/// The wave evaluator runs it for each lane of the wave; lanes meet nowhere (the subgroup
-/// operations of chunk 7c are not emitted yet), so a lane's result does not depend on the
-/// others.
+/// One console lane of the program, alone: `lane` is its lane index (what `v_mbcnt(-1, .)`
+/// counts). Programs without a subgroup operation can run each lane of a wave this way (a lane
+/// may then branch its own way); `interp_wave` runs the lanes together.
 fn interp_lane(f: &Func, s: &Structured, ins: &[(Reg, u32)], lane: u32) -> Result<Out, SpirvError> {
-    let mut slots: HashMap<(u16, u8), u32> = HashMap::new();
-    let mut env: HashMap<Val, Opd<Cpu>> = HashMap::new();
-    let mut out = Out::new();
-    for &(reg, val) in &f.args {
-        let o = if s.masks.is_mask(val) {
-            Opd::B(true)
-        } else {
-            Opd::V(ins.iter().find(|(r, _)| *r == reg).map_or(0, |x| x.1))
+    Ok(interp_wave(f, s, &[ins.to_vec()], &[lane], 1)?.remove(0))
+}
+
+/// The state of one lane of the evaluator.
+struct LaneSt {
+    env: HashMap<Val, Opd<Cpu>>,
+    slots: HashMap<(u16, u8), u32>,
+    out: Out,
+    lane: u32,
+}
+
+/// What a subgroup instruction made of one lane's inputs.
+#[derive(Clone, Copy)]
+enum Swap {
+    /// The result of the instruction.
+    Result(u32),
+    /// The source operand of a DPP instruction, already swapped.
+    Source(u32),
+}
+
+fn lane_inst(
+    f: &Func,
+    s: &Structured,
+    (cb, k): (usize, usize),
+    st: &mut LaneSt,
+    swap: Option<Swap>,
+) -> Result<(), SpirvError> {
+    let i = &f.blocks[cb].insts[k];
+    match s.masks.lanes.get(&i.instr.at) {
+        Some(&LaneUse::SlotWrite { vgpr, lane }) => {
+            st.slots
+                .insert((vgpr, lane), as_u32(rd(&st.env, i.srcs[0][0])?));
+            return Ok(());
+        }
+        Some(&LaneUse::SlotRead { vgpr, lane }) => {
+            let x = st.slots.get(&(vgpr, lane)).copied().unwrap_or(0);
+            st.env.insert(i.dsts[0].1, Opd::V(x));
+            st.out.insert((i.dsts[0].0, false), x);
+            return Ok(());
+        }
+        _ => {}
+    }
+    let mut srcs = i
+        .srcs
+        .iter()
+        .map(|v| {
+            v.iter()
+                .map(|&d| rd(&st.env, d))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let imps = i
+        .imps
+        .iter()
+        .map(|&(r, d)| Ok((r, rd(&st.env, d)?)))
+        .collect::<Result<Vec<_>, SpirvError>>()?;
+    let mut wave = None;
+    match swap {
+        Some(Swap::Result(x)) => wave = Some(Opd::V(x)),
+        Some(Swap::Source(x)) => {
+            srcs[0][0] = Opd::V(x);
+            wave = Some(Opd::V(x));
+        }
+        None => {}
+    }
+    let active = if s.guards[cb][k] == Guard::Active {
+        i.imps
+            .iter()
+            .find(|(r, _)| *r == Reg::ExecLo)
+            .map(|&(_, d)| {
+                nonzero(
+                    st.env[&match d {
+                        Src::Val(v) => v,
+                        _ => panic!("EXEC is a value"),
+                    }],
+                )
+            })
+    } else {
+        None
+    };
+    let ctx = Ctx {
+        inst: i,
+        srcs,
+        imps,
+        dst_mask: i.dsts.iter().map(|(_, v)| s.masks.is_mask(*v)).collect(),
+        active,
+        lane: Some(st.lane),
+        wave,
+    };
+    let res = exec(&mut Cpu, &ctx)?;
+    for ((reg, val), o) in i.dsts.iter().zip(res) {
+        st.env.insert(*val, o);
+        st.out.insert((*reg, s.masks.is_mask(*val)), as_u32(o));
+    }
+    Ok(())
+}
+
+/// The program on every lane of a wave at once, in lock step (every lane takes the same path:
+/// the subgroup instructions need all of them). `lanes` are the console lane indices, `host`
+/// the width of the host's subgroups: the lanes are cut in groups of `host` that the subgroup
+/// operations (reductions, ballots) work in, quads being 4 lanes on any host.
+fn interp_wave(
+    f: &Func,
+    s: &Structured,
+    ins: &[Vec<(Reg, u32)>],
+    lanes: &[u32],
+    host: usize,
+) -> Result<Vec<Out>, SpirvError> {
+    let _ = host;
+    let mut sts: Vec<LaneSt> = Vec::new();
+    for (n, &lane) in lanes.iter().enumerate() {
+        let mut st = LaneSt {
+            env: HashMap::new(),
+            slots: HashMap::new(),
+            out: Out::new(),
+            lane,
         };
-        env.insert(val, o);
+        for &(reg, val) in &f.args {
+            let o = if s.masks.is_mask(val) {
+                Opd::B(true)
+            } else {
+                Opd::V(ins[n].iter().find(|(r, _)| *r == reg).map_or(0, |x| x.1))
+            };
+            st.env.insert(val, o);
+        }
+        sts.push(st);
     }
     let mut cb = f.entry;
     let mut prev: Option<usize> = None;
     for _ in 0..100_000 {
         let blk = &f.blocks[cb];
-        let mut phis = Vec::new();
-        for p in &blk.phis {
-            let (_, src) = p.args.iter().find(|(b, _)| Some(*b) == prev).unwrap();
-            phis.push((p.reg, p.dst, rd(&env, *src)?));
-        }
-        for (reg, dst, o) in phis {
-            env.insert(dst, o);
-            out.insert((reg, s.masks.is_mask(dst)), as_u32(o));
+        for st in &mut sts {
+            let mut phis = Vec::new();
+            for p in &blk.phis {
+                let (_, src) = p.args.iter().find(|(b, _)| Some(*b) == prev).unwrap();
+                phis.push((p.reg, p.dst, rd(&st.env, *src)?));
+            }
+            for (reg, dst, o) in phis {
+                st.env.insert(dst, o);
+                st.out.insert((reg, s.masks.is_mask(dst)), as_u32(o));
+            }
         }
         for (k, i) in blk.insts.iter().enumerate() {
-            match s.masks.lanes.get(&i.instr.at) {
-                Some(&LaneUse::SlotWrite { vgpr, lane }) => {
-                    slots.insert((vgpr, lane), as_u32(rd(&env, i.srcs[0][0])?));
-                    continue;
+            let at = (cb, k);
+            let use_ = s.masks.lanes.get(&i.instr.at).copied();
+            match use_ {
+                Some(LaneUse::Quad { sel }) => {
+                    let xs: Vec<u32> = sts
+                        .iter()
+                        .map(|st| rd(&st.env, i.srcs[0][0]).map(as_u32))
+                        .collect::<Result<_, _>>()?;
+                    let dpp = i.instr.dpp.is_some();
+                    for (n, st) in sts.iter_mut().enumerate() {
+                        let x = xs[(n & !3) | sel[n & 3] as usize];
+                        lane_inst(
+                            f,
+                            s,
+                            at,
+                            st,
+                            Some(if dpp {
+                                Swap::Source(x)
+                            } else {
+                                Swap::Result(x)
+                            }),
+                        )?;
+                    }
                 }
-                Some(&LaneUse::SlotRead { vgpr, lane }) => {
-                    let x = slots.get(&(vgpr, lane)).copied().unwrap_or(0);
-                    env.insert(i.dsts[0].1, Opd::V(x));
-                    out.insert((i.dsts[0].0, false), x);
-                    continue;
+                _ => {
+                    for st in &mut sts {
+                        lane_inst(f, s, at, st, None)?;
+                    }
                 }
-                _ => {}
-            }
-            let srcs = i
-                .srcs
-                .iter()
-                .map(|v| {
-                    v.iter()
-                        .map(|&d| rd(&env, d))
-                        .collect::<Result<Vec<_>, _>>()
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let imps = i
-                .imps
-                .iter()
-                .map(|&(r, d)| Ok((r, rd(&env, d)?)))
-                .collect::<Result<Vec<_>, SpirvError>>()?;
-            let active = if s.guards[cb][k] == Guard::Active {
-                i.imps
-                    .iter()
-                    .find(|(r, _)| *r == Reg::ExecLo)
-                    .map(|&(_, d)| {
-                        nonzero(
-                            env[&match d {
-                                Src::Val(v) => v,
-                                _ => panic!("EXEC is a value"),
-                            }],
-                        )
-                    })
-            } else {
-                None
-            };
-            let ctx = Ctx {
-                inst: i,
-                srcs,
-                imps,
-                dst_mask: i.dsts.iter().map(|(_, v)| s.masks.is_mask(*v)).collect(),
-                active,
-                lane: Some(lane),
-            };
-            let res = exec(&mut Cpu, &ctx)?;
-            for ((reg, val), o) in i.dsts.iter().zip(res) {
-                env.insert(*val, o);
-                out.insert((*reg, s.masks.is_mask(*val)), as_u32(o));
             }
         }
         let next = match &blk.term {
-            Term::End => return Ok(out),
+            Term::End => return Ok(sts.into_iter().map(|st| st.out).collect()),
             Term::Jump(t) => *t,
             Term::Branch {
                 op,
@@ -182,26 +274,34 @@ fn interp_lane(f: &Func, s: &Structured, ins: &[(Reg, u32)], lane: u32) -> Resul
                 taken,
                 fall,
             } => {
-                let go = match &s.branches[cb] {
-                    Some(BranchKind::Lane(t) | BranchKind::Wave(t)) => {
-                        let bit = nonzero(env[&t.vals[0]]);
-                        bit == t.taken_when_set
-                    }
-                    _ => {
-                        let nz = cond
-                            .iter()
-                            .map(|(_, c)| rd(&env, *c).map(nonzero))
-                            .collect::<Result<Vec<_>, _>>()?
-                            .into_iter()
-                            .any(|x| x);
-                        let set = matches!(
-                            *op,
-                            "s_cbranch_scc1" | "s_cbranch_vccnz" | "s_cbranch_execnz"
-                        );
-                        !cond.is_empty() && nz == set
-                    }
-                };
-                if go {
+                let mut gos = Vec::new();
+                for st in &sts {
+                    let go = match &s.branches[cb] {
+                        Some(BranchKind::Lane(t) | BranchKind::Wave(t)) => {
+                            let bit = nonzero(st.env[&t.vals[0]]);
+                            bit == t.taken_when_set
+                        }
+                        _ => {
+                            let nz = cond
+                                .iter()
+                                .map(|(_, c)| rd(&st.env, *c).map(nonzero))
+                                .collect::<Result<Vec<_>, _>>()?
+                                .into_iter()
+                                .any(|x| x);
+                            let set = matches!(
+                                *op,
+                                "s_cbranch_scc1" | "s_cbranch_vccnz" | "s_cbranch_execnz"
+                            );
+                            !cond.is_empty() && nz == set
+                        }
+                    };
+                    gos.push(go);
+                }
+                assert!(
+                    gos.iter().all(|g| *g == gos[0]) || sts.len() == 1,
+                    "the lanes of a lock-step wave take different paths"
+                );
+                if gos[0] {
                     *taken
                 } else {
                     *fall
@@ -2048,6 +2148,7 @@ fn a_probe_has_no_lane_index_in_a_vertex_or_pixel_program() {
         dst_mask: vec![false],
         active: None,
         lane: None,
+        wave: None,
     };
     match exec(&mut Cpu, &ctx) {
         Err(Unsupported { chunk: 7, op }) => assert!(op.contains("lane index"), "{op}"),
@@ -3473,4 +3574,119 @@ pub(crate) mod stage {
         // the second slice is untouched
         assert!(back[1][64..].iter().all(|&v| v == -1.0));
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// Chunk 7c: quad operations
+
+/// The lock-step wave evaluator over `lanes` console lanes; `v0` is the lane's own input.
+fn lock(
+    f: &Func,
+    s: &Structured,
+    lanes: u32,
+    host: usize,
+    ins: impl Fn(u32) -> Vec<(Reg, u32)>,
+) -> Vec<Out> {
+    let ids: Vec<u32> = (0..lanes).collect();
+    let all: Vec<Vec<(Reg, u32)>> = ids.iter().map(|&l| ins(l)).collect();
+    interp_wave(f, s, &all, &ids, host).unwrap()
+}
+
+fn quad_expect(sel: [usize; 4], lanes: u32, v: impl Fn(u32) -> u32) -> Vec<u32> {
+    (0..lanes)
+        .map(|n| v((n & !3) + sel[(n & 3) as usize] as u32))
+        .collect()
+}
+
+#[test]
+fn ds_swizzle_quad_modes_permute_inside_the_quad() {
+    let cases: [(&str, [usize; 4]); 7] = [
+        (
+            "ds_swizzle_b32 v1, v0 offset:swizzle(QUAD_PERM,1,1,1,1)",
+            [1; 4],
+        ),
+        (
+            "ds_swizzle_b32 v1, v0 offset:swizzle(QUAD_PERM,1,0,3,2)",
+            [1, 0, 3, 2],
+        ),
+        (
+            "ds_swizzle_b32 v1, v0 offset:swizzle(QUAD_PERM,0,1,0,1)",
+            [0, 1, 0, 1],
+        ),
+        (
+            "ds_swizzle_b32 v1, v0 offset:swizzle(QUAD_PERM,3,2,1,0)",
+            [3, 2, 1, 0],
+        ),
+        (
+            "ds_swizzle_b32 v1, v0 offset:swizzle(QUAD_PERM,0,0,2,2)",
+            [0, 0, 2, 2],
+        ),
+        // bitmask mode that leaves the bits above the quad alone
+        (
+            "ds_swizzle_b32 v1, v0 offset:swizzle(BITMASK_PERM,\"pppip\")",
+            [2, 3, 0, 1],
+        ),
+        (
+            "ds_swizzle_b32 v1, v0 offset:swizzle(BITMASK_PERM,\"ppp01\")",
+            [1; 4],
+        ),
+    ];
+    for (asm, sel) in cases {
+        let (fun, s) = wave_ok(&[asm]);
+        module_of(&fun).unwrap();
+        for host in [4, 8, 32] {
+            let out = lock(&fun, &s, 32, host, |l| vec![(Reg::V(0), 1000 + l * 7)]);
+            let got: Vec<u32> = out.iter().map(|o| get(o, Reg::V(1))).collect();
+            assert_eq!(
+                got,
+                quad_expect(sel, 32, |n| 1000 + n * 7),
+                "{asm} host {host}"
+            );
+        }
+    }
+}
+
+#[test]
+fn dpp_quad_perm_swaps_the_source_then_runs_the_instruction() {
+    // v1 = v0[quad lane 3 - k] + v2, floats; the old v1 is not read
+    let (fun, s) =
+        wave_ok(&["v_add_f32_dpp v1, v0, v2 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf"]);
+    module_of(&fun).unwrap();
+    let x = |n: u32| (n as f32 + 0.5).to_bits();
+    let out = lock(&fun, &s, 16, 8, |l| {
+        vec![(Reg::V(0), x(l)), (Reg::V(2), 100f32.to_bits())]
+    });
+    for (n, o) in out.iter().enumerate() {
+        let src = (n & !3) + 3 - (n & 3);
+        assert_eq!(f32::from_bits(get(o, Reg::V(1))), src as f32 + 0.5 + 100.0);
+    }
+    let (fun, s) =
+        wave_ok(&["v_mov_b32_dpp v1, v0 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"]);
+    module_of(&fun).unwrap();
+    let out = lock(&fun, &s, 8, 4, |l| vec![(Reg::V(0), 10 + l)]);
+    let got: Vec<u32> = out.iter().map(|o| get(o, Reg::V(1))).collect();
+    assert_eq!(got, [11, 10, 13, 12, 15, 14, 17, 16]);
+    // dpp8 that stays in the quad, the same in both quads of its group of 8
+    let (fun, s) = wave_ok(&["v_mov_b32_dpp v1, v0 dpp8:[1,0,3,2,5,4,7,6]"]);
+    module_of(&fun).unwrap();
+    let out = lock(&fun, &s, 8, 8, |l| vec![(Reg::V(0), 10 + l)]);
+    let got: Vec<u32> = out.iter().map(|o| get(o, Reg::V(1))).collect();
+    assert_eq!(got, [11, 10, 13, 12, 15, 14, 17, 16]);
+}
+
+#[test]
+fn what_leaves_the_quad_stays_refused_by_name() {
+    // a row shift, a partial row mask and a bitmask swizzle across quads are not quad ops
+    assert_eq!(
+        first_cross_lane(&["v_mov_b32_dpp v1, v0 row_shl:1 row_mask:0xf bank_mask:0xf"]),
+        "v_mov_b32 (dpp)"
+    );
+    assert_eq!(
+        first_cross_lane(&["v_mov_b32_dpp v1, v0 quad_perm:[1,0,3,2] row_mask:0x5 bank_mask:0xf"]),
+        "v_mov_b32 (dpp)"
+    );
+    assert_eq!(
+        first_cross_lane(&["ds_swizzle_b32 v1, v0 offset:swizzle(BITMASK_PERM,\"11110\")"]),
+        "ds_swizzle_b32"
+    );
 }

@@ -79,6 +79,8 @@ pub struct Gen {
     locals: Vec<u32>,
     terminated: bool,
     glsl: u32,
+    /// The program uses a subgroup operation: it needs maximal reconvergence.
+    wave: bool,
 }
 
 impl Gen {
@@ -97,6 +99,7 @@ impl Gen {
             locals: Vec::new(),
             terminated: false,
             glsl,
+            wave: false,
         }
     }
 
@@ -127,9 +130,29 @@ impl Gen {
     /// `OpGroupNonUniformAny` over the subgroup: true when any invocation has `a` set.
     pub(super) fn any(&mut self, a: u32) -> u32 {
         self.m.capability(Capability::GroupNonUniformVote);
+        self.wave = true;
         let t = self.t_bool();
         let scope = self.k(3); // Subgroup
         self.op(Op::GroupNonUniformAny, t, &[scope, a])
+    }
+
+    /// The value of the lane `idx` (0..4) of the quad, in every lane of it.
+    pub(super) fn quad_broadcast(&mut self, a: u32, idx: u32) -> u32 {
+        self.m.capability(Capability::GroupNonUniformQuad);
+        self.wave = true;
+        let t = self.t_u32();
+        let (scope, i) = (self.k(3), self.k(idx));
+        self.op(Op::GroupNonUniformQuadBroadcast, t, &[scope, a, i])
+    }
+
+    /// The value of the quad lane the direction (0 horizontal, 1 vertical, 2 diagonal) swaps
+    /// this one with.
+    pub(super) fn quad_swap(&mut self, a: u32, dir: u32) -> u32 {
+        self.m.capability(Capability::GroupNonUniformQuad);
+        self.wave = true;
+        let t = self.t_u32();
+        let (scope, d) = (self.k(3), self.k(dir));
+        self.op(Op::GroupNonUniformQuadSwap, t, &[scope, a, d])
     }
 
     /// Starts a new (unreachable) block when the current one already ended.
@@ -462,6 +485,10 @@ struct Tr<'a> {
     lane_ifs: u32,
     /// The scalar variable of each spill slot `(vgpr, lane)` (`LaneUse::Slot*`).
     slots: HashMap<(u16, u8), u32>,
+    /// `SubgroupLocalInvocationId`, created on first use, and the interface variables the
+    /// emitter itself adds.
+    sg_id: Option<u32>,
+    extra_iface: Vec<u32>,
 }
 
 /// Translates a structured program to the probe module.
@@ -578,6 +605,8 @@ fn build<'a>(f: &'a Func, s: &'a Structured, io: Option<&'a StageIo>) -> Result<
         stage,
         lane_ifs: 0,
         slots,
+        sg_id: None,
+        extra_iface: Vec::new(),
     };
     let entry = t.g.m.id();
     t.g.label(entry);
@@ -604,6 +633,12 @@ fn build<'a>(f: &'a Func, s: &'a Structured, io: Option<&'a StageIo>) -> Result<
     t.g.m.add_function(&words);
     let mut samplers = Vec::new();
     let mut flags = (false, false, false);
+    iface.extend(std::mem::take(&mut t.extra_iface));
+    if t.g.wave {
+        // the host's active set at a subgroup operation is the set of invocations whose
+        // structured flow reached it
+        t.g.m.extension("SPV_KHR_maximal_reconvergence");
+    }
     match t.stage.take() {
         Some(st) => {
             iface.extend(st.interface());
@@ -618,6 +653,10 @@ fn build<'a>(f: &'a Func, s: &'a Structured, io: Option<&'a StageIo>) -> Result<
                 .entry_point(ExecutionModel::GLCompute, main, "main", &iface);
             t.g.m.exec_mode(main, ExecutionMode::LocalSize, &[1, 1, 1]);
         }
+    }
+    if t.g.wave {
+        t.g.m
+            .exec_mode(main, ExecutionMode::MaximallyReconvergesKHR, &[]);
     }
     t.g.m.name(main, "main");
     Ok((t.g.m.finish(), inputs, outputs, samplers, flags))
@@ -766,6 +805,18 @@ impl Tr<'_> {
                 }
                 srcs.push(v);
             }
+            let mut wave = None;
+            if let Some(LaneUse::Quad { sel }) = lane_use {
+                let Some(&Opd::V(x)) = srcs.first().and_then(|s| s.first()) else {
+                    return bad("a quad operation on something that is not a dword");
+                };
+                let r = Opd::V(self.quad_perm(x, sel));
+                if i.instr.dpp.is_some() {
+                    // the table runs the instruction on the permuted source
+                    srcs[0][0] = r;
+                }
+                wave = Some(r);
+            }
             let mut imps = Vec::new();
             for &(r, s) in &i.imps {
                 imps.push((r, self.read(s)?));
@@ -801,6 +852,7 @@ impl Tr<'_> {
                 dst_mask,
                 active,
                 lane,
+                wave,
             };
             let res = match self.stage_exec(&ctx, b, k)? {
                 Some(r) => r,
