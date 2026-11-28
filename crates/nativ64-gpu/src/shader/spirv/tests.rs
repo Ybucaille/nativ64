@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use super::alu::{exec, Cpu, Ctx, Opd, Unsupported, Wave};
-use super::emit::{translate, Probe, SpirvError};
+use super::emit::{translate, translate_wave, Probe, SpirvError};
 use super::gpu::{self, Gpu, Run};
 use crate::shader::ir::{build, EntryRegs, Func, Reg, Src, Term, Val};
 use crate::shader::structure::{structure, BranchKind, Guard, LaneUse, Scan, Structured, WaveOp};
@@ -4066,4 +4066,132 @@ fn host_lane_numbers_are_refused_beside_a_console_lane_index() {
         ]),
         "v_mbcnt_lo_u32_b32"
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// Chunk 7c on a device: one program per subgroup feature, a whole wave in one workgroup
+
+/// Runs on the backend's device (`NATIV64_GPU`, lavapipe in CI; `NATIV64_SPIRV_DEVICE`
+/// overrides it): every lane's registers against the wave evaluator with one of the device's
+/// subgroup sizes, invocation `n` being console lane `n`.
+#[test]
+fn subgroup_programs_on_a_device_match_the_wave_evaluator() {
+    let want = match std::env::var("NATIV64_SPIRV_DEVICE") {
+        Ok(name) => name,
+        // opening it also checks that it meets what the backend requires
+        Err(_) => match crate::backend::vk::Gpu::open() {
+            Ok(g) => g.name().to_string(),
+            Err(e) => {
+                assert!(
+                    std::env::var_os("NATIV64_GPU").is_none(),
+                    "NATIV64_GPU is set: {e}"
+                );
+                println!("skipped: no Vulkan device ({e})");
+                return;
+            }
+        },
+    };
+    let _lock = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let g = Gpu::named(&want).unwrap_or_else(|e| panic!("{want}: {e}"));
+    let (min, max) = g.subgroup_sizes;
+    let widths: Vec<usize> = (2..8)
+        .map(|k| 1 << k)
+        .filter(|&w| w >= min && w <= max)
+        .map(|w| w as usize)
+        .collect();
+    println!("{want}: subgroups of {min} to {max}");
+    let mut sum = SUM_SECTION.to_vec();
+    sum.extend(["v_mov_b32_e32 v3, v1", "v_mov_b32_e32 v4, s6"]);
+    let programs: [(&str, u32, Vec<&str>); 6] = [
+        (
+            "quad swizzle: broadcast, swap, select",
+            32,
+            vec![
+                "ds_swizzle_b32 v1, v0 offset:swizzle(QUAD_PERM,1,1,1,1)",
+                "ds_swizzle_b32 v2, v0 offset:swizzle(QUAD_PERM,1,0,3,2)",
+                "ds_swizzle_b32 v3, v0 offset:swizzle(QUAD_PERM,0,0,2,2)",
+            ],
+        ),
+        (
+            "DPP quad_perm",
+            32,
+            vec!["v_add_nc_u32_dpp v1, v0, v0 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf"],
+        ),
+        (
+            "ballot, mask as data and shuffle, wave32",
+            32,
+            vec![
+                "v_cmp_lt_u32_e32 vcc_lo, 3, v0",
+                "s_bcnt1_i32_b32 s4, vcc_lo",
+                "s_ff1_i32_b32 s5, vcc_lo",
+                "v_readlane_b32 s6, v0, s5",
+                "v_mbcnt_lo_u32_b32 v3, vcc_lo, 0",
+                "v_mov_b32_e32 v4, s6",
+            ],
+        ),
+        (
+            "ballot, wave64",
+            64,
+            vec![
+                "[w64] v_cmp_lt_u32_e32 vcc, 3, v0",
+                "[w64] s_bcnt1_i32_b64 s4, vcc",
+                "[w64] v_mbcnt_lo_u32_b32 v3, vcc_lo, 0",
+                "[w64] v_mbcnt_hi_u32_b32 v3, vcc_hi, v3",
+            ],
+        ),
+        (
+            "votes",
+            32,
+            vec![
+                "v_cmp_lt_u32_e32 vcc_lo, 11, v0",
+                "s_cmp_lg_u32 vcc_lo, 0",
+                "s_cselect_b32 s7, 1, 0",
+                "s_cmp_eq_u32 vcc_lo, exec_lo",
+                "s_cselect_b32 s6, 1, 0",
+            ],
+        ),
+        ("whole-wave sum and prefix sum", 32, sum),
+    ];
+    for (what, lanes, lines) in programs {
+        let (fun, s) = wave_ok(&lines);
+        let p = translate_wave(&fun, &s, lanes).unwrap_or_else(|e| panic!("{what}: {e}"));
+        validate(&p.words);
+        let ins = |l: u32| vec![(V0, l)];
+        let mut words = Vec::new();
+        for l in 0..lanes {
+            let of = ins(l);
+            words.extend(
+                p.inputs
+                    .iter()
+                    .map(|r| of.iter().find(|(x, _)| x == r).map_or(0, |x| x.1)),
+            );
+        }
+        let n = p.outputs.len();
+        let run = g
+            .load(&p.words, words.len(), n * lanes as usize)
+            .unwrap_or_else(|e| panic!("{what}: the device refuses the module: {e}"));
+        let got = run.go(&words).unwrap_or_else(|e| panic!("{what}: {e}"));
+        // the first lane and register that differ from the evaluator at `host`, if any
+        let differs = |host: usize| {
+            let want = lock(&fun, &s, lanes, host, ins);
+            let mut compared = 0;
+            for (lane, out) in want.iter().enumerate() {
+                for (k, key) in p.outputs.iter().enumerate() {
+                    let Some(&w) = out.get(key) else { continue };
+                    let a = got[lane * n + k];
+                    if a != w {
+                        return Some(format!("lane {lane}, {}: {a:#x}, not {w:#x}", key.0));
+                    }
+                    compared += 1;
+                }
+            }
+            assert!(compared >= lanes, "{what}: nothing compared");
+            None
+        };
+        let bad: Vec<_> = widths.iter().map(|&w| (w, differs(w))).collect();
+        match bad.iter().find(|(_, d)| d.is_none()) {
+            Some((w, _)) => println!("{what}: as the evaluator with subgroups of {w}"),
+            None => panic!("{what}: {bad:?}"),
+        }
+    }
 }

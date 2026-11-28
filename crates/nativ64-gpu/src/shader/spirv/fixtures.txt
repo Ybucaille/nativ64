@@ -492,3 +492,9 @@ c103febe	s_mov_b32 exec_lo, -1
 080061d7000a0102	v_writelane_b32 v8, s0, 5
 060060d7080b0102	v_readlane_b32 s6, v8, 5
 050065d7c1000102	v_mbcnt_lo_u32_b32 v5, -1, 0
+b180d4d800000002	ds_swizzle_b32 v2, v0 offset:swizzle(QUAD_PERM,1,0,3,2)
+a080d4d800000003	ds_swizzle_b32 v3, v0 offset:swizzle(QUAD_PERM,0,0,2,2)
+fa00024a001b00ff	v_add_nc_u32_dpp v1, v0, v0 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf
+060060d7000b0002	v_readlane_b32 s6, v0, s5
+8b00827d	v_cmp_lt_u32_e32 vcc_lo, 11, v0
+81800685	s_cselect_b32 s6, 1, 0

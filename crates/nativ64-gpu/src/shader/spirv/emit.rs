@@ -585,12 +585,28 @@ struct Tr<'a> {
     /// `SubgroupLocalInvocationId`, created on first use, and the interface variables the
     /// emitter itself adds.
     sg_id: Option<u32>,
+    /// `LocalInvocationIndex` of a wave probe, created on first use.
+    local_id: Option<u32>,
+    /// The invocations of a wave probe (`translate_wave`); `None` for one lane or a stage.
+    wave_lanes: Option<u32>,
     extra_iface: Vec<u32>,
 }
 
 /// Translates a structured program to the probe module.
 pub fn translate(f: &Func, s: &Structured) -> Result<Probe, SpirvError> {
-    let (words, inputs, outputs, _, _) = build(f, s, None)?;
+    probe(f, s, None)
+}
+
+/// The probe over a whole wave, for the device tests of the subgroup operations: one workgroup
+/// of `lanes` invocations, invocation `n` being console lane `n` with the `n`-th run of
+/// `inputs.len()` dwords of binding 0 and of `outputs.len()` dwords of binding 1.
+#[cfg(test)]
+pub(crate) fn translate_wave(f: &Func, s: &Structured, lanes: u32) -> Result<Probe, SpirvError> {
+    probe(f, s, Some(lanes))
+}
+
+fn probe(f: &Func, s: &Structured, lanes: Option<u32>) -> Result<Probe, SpirvError> {
+    let (words, inputs, outputs, _, _) = build(f, s, None, lanes)?;
     Ok(Probe {
         words,
         inputs,
@@ -601,7 +617,7 @@ pub fn translate(f: &Func, s: &Structured) -> Result<Probe, SpirvError> {
 /// Translates a structured vertex or pixel program to a module with its real entry point:
 /// inputs from the root block and the stage's built-ins, outputs to the stage's variables.
 pub fn translate_io(f: &Func, s: &Structured, io: &StageIo) -> Result<Translated, SpirvError> {
-    let (words, _, _, samplers, flags) = build(f, s, Some(io))?;
+    let (words, _, _, samplers, flags) = build(f, s, Some(io), None)?;
     Ok(Translated {
         words,
         samplers,
@@ -619,7 +635,12 @@ type Built = (
     (bool, bool, bool),
 );
 
-fn build<'a>(f: &'a Func, s: &'a Structured, io: Option<&'a StageIo>) -> Result<Built, SpirvError> {
+fn build<'a>(
+    f: &'a Func,
+    s: &'a Structured,
+    io: Option<&'a StageIo>,
+    lanes: Option<u32>,
+) -> Result<Built, SpirvError> {
     let mut g = Gen::new();
     let (tu, tb) = (g.t_u32(), g.t_bool());
     let pu = g.t_ptr(StorageClass::Private, tu);
@@ -715,6 +736,8 @@ fn build<'a>(f: &'a Func, s: &'a Structured, io: Option<&'a StageIo>) -> Result<
         slots,
         leaves,
         sg_id: None,
+        local_id: None,
+        wave_lanes: lanes,
         extra_iface: Vec::new(),
     };
     let entry = t.g.m.id();
@@ -760,7 +783,8 @@ fn build<'a>(f: &'a Func, s: &'a Structured, io: Option<&'a StageIo>) -> Result<
         None => {
             t.g.m
                 .entry_point(ExecutionModel::GLCompute, main, "main", &iface);
-            t.g.m.exec_mode(main, ExecutionMode::LocalSize, &[1, 1, 1]);
+            let size = [lanes.unwrap_or(1), 1, 1];
+            t.g.m.exec_mode(main, ExecutionMode::LocalSize, &size);
         }
     }
     if t.g.wave {
@@ -779,11 +803,18 @@ impl Tr<'_> {
         }
     }
 
-    fn buf_ptr(&mut self, buf: u32, index: u32) -> u32 {
+    /// Dword `index` of a probe buffer, in this invocation's run of `stride` dwords.
+    fn buf_ptr(&mut self, buf: u32, index: u32, stride: usize) -> u32 {
         let tu = self.g.t_u32();
         let p = self.g.t_ptr(StorageClass::StorageBuffer, tu);
         let zero = self.g.k(0);
-        let i = self.g.k(index);
+        let mut i = self.g.k(index);
+        if self.wave_lanes.is_some() {
+            let lane = self.local_index();
+            let n = self.g.k(stride as u32);
+            let base = self.g.ibin(IBin::Mul, lane, n);
+            i = self.g.ibin(IBin::Add, base, i);
+        }
         self.g.op(Op::AccessChain, p, &[buf, zero, i])
     }
 
@@ -797,7 +828,7 @@ impl Tr<'_> {
                 let v = self.var(*reg, true)?;
                 self.g.store(v, t);
             } else {
-                let p = self.buf_ptr(self.in_buf, k as u32);
+                let p = self.buf_ptr(self.in_buf, k as u32, inputs.len());
                 let x = self.g.load(tu, p);
                 let v = self.var(*reg, false)?;
                 self.g.store(v, x);
@@ -819,7 +850,7 @@ impl Tr<'_> {
             } else {
                 self.g.load(tu, v)
             };
-            let p = self.buf_ptr(self.out_buf, k as u32);
+            let p = self.buf_ptr(self.out_buf, k as u32, self.vars.len());
             self.g.store(p, x);
         }
         Ok(())

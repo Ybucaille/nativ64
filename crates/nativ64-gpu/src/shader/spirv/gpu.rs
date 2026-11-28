@@ -3,6 +3,7 @@
 //! in CI). One dispatch of one invocation per input vector, so the module's results can be
 //! compared with the CPU evaluator on the same bytes.
 
+use crate::backend::vk::subgroup::Subgroups;
 use ash::vk;
 
 pub fn enabled() -> bool {
@@ -16,6 +17,8 @@ pub struct Gpu {
     queue: vk::Queue,
     pool: vk::CommandPool,
     mem_type: u32,
+    /// The smallest and largest subgroup the device may run a shader with.
+    pub subgroup_sizes: (u32, u32),
 }
 
 /// A module's pipeline with its two buffers.
@@ -30,10 +33,16 @@ pub struct Run<'a> {
 }
 
 impl Gpu {
+    /// The device `NATIV64_SPIRV_DEVICE` names, the first one when unset.
     pub fn new() -> Result<Self, String> {
+        Self::named(&std::env::var("NATIV64_SPIRV_DEVICE").unwrap_or_default())
+    }
+
+    /// The first device whose name contains `want`.
+    pub fn named(want: &str) -> Result<Self, String> {
         let e = |x: vk::Result| format!("{x:?}");
         let entry = unsafe { ash::Entry::load() }.map_err(|e| e.to_string())?;
-        let app = vk::ApplicationInfo::default().api_version(vk::make_api_version(0, 1, 2, 0));
+        let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_3);
         let instance = unsafe {
             entry.create_instance(
                 &vk::InstanceCreateInfo::default().application_info(&app),
@@ -41,7 +50,6 @@ impl Gpu {
             )
         }
         .map_err(e)?;
-        let want = std::env::var("NATIV64_SPIRV_DEVICE").unwrap_or_default();
         let devs = unsafe { instance.enumerate_physical_devices() }.map_err(e)?;
         let mut pick = None;
         for d in devs {
@@ -50,7 +58,7 @@ impl Gpu {
                 .device_name_as_c_str()
                 .map(|c| c.to_string_lossy().to_string())
                 .unwrap_or_default();
-            if pick.is_none() && name.contains(&want) {
+            if pick.is_none() && name.contains(want) {
                 pick = Some((d, name));
             }
         }
@@ -69,16 +77,23 @@ impl Gpu {
         let mut f12 = vk::PhysicalDeviceVulkan12Features::default();
         let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut f12);
         unsafe { instance.get_physical_device_features2(pd, &mut f2) };
-        let device = unsafe {
-            instance.create_device(
-                pd,
-                &vk::DeviceCreateInfo::default()
-                    .queue_create_infos(&qi)
-                    .push_next(&mut f2),
-                None,
-            )
+        let sg = Subgroups::query(&instance, pd);
+        let mut p13 = vk::PhysicalDeviceVulkan13Properties::default();
+        let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut p13);
+        unsafe { instance.get_physical_device_properties2(pd, &mut p2) };
+        let subgroup_sizes = (p13.min_subgroup_size, p13.max_subgroup_size);
+        let mut mr = vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR::default()
+            .shader_maximal_reconvergence(true);
+        let mut exts = Vec::new();
+        let mut info = vk::DeviceCreateInfo::default()
+            .queue_create_infos(&qi)
+            .push_next(&mut f2);
+        if sg.max_reconvergence {
+            exts.push(ash::khr::shader_maximal_reconvergence::NAME.as_ptr());
+            info = info.push_next(&mut mr);
         }
-        .map_err(e)?;
+        info = info.enabled_extension_names(&exts);
+        let device = unsafe { instance.create_device(pd, &info, None) }.map_err(e)?;
         let queue = unsafe { device.get_device_queue(q, 0) };
         let pool = unsafe {
             device.create_command_pool(
@@ -104,6 +119,7 @@ impl Gpu {
             queue,
             pool,
             mem_type,
+            subgroup_sizes,
         })
     }
 

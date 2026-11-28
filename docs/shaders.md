@@ -535,11 +535,31 @@ operations in `spirv/emit.rs` and `spirv/emit/stage.rs`):
 - Every program with a subgroup operation declares `MaximallyReconvergesKHR`.
 - **Wave evaluator**: `interp_wave` runs the lanes in lock step with a host width (subgroup
   results computed per group of that width).
+- **Host requirements** (`backend/vk/subgroup.rs`, the one list): basic, vote, arithmetic,
+  ballot, shuffle and quad in compute and fragment, `subgroupSize` of 4 or more. Vertex
+  support is per pipeline (lavapipe has none: such a vertex program is refused there), as are
+  quads outside compute and fragment (`quadOperationsInAllStages`).
+  `VK_KHR_shader_maximal_reconvergence` is enabled when present; else its declaration is
+  removed from the modules and divergent subgroup operations follow the driver's own
+  reconvergence.
+- **Device test**: `translate_wave` is the probe over one workgroup of 32 or 64 lanes; one
+  program per subgroup feature is compared lane by lane with `interp_wave` on the backend's
+  device (in CI, lavapipe). Passes with subgroups of 8 (lavapipe), 32 (NVIDIA) and 16 or
+  narrower (Intel, which reports 32; the backend refuses it for another feature).
+- **Open: wave64 on a narrower host is not the console's result.** Votes, ballot counts,
+  `s_ff1`, `mbcnt` of a mask, reductions and scans cover one host subgroup. On 32 lanes a
+  64-lane sum gives each half its own sum, a prefix restarts at lane 32, `s_bcnt1` counts
+  half the mask, and the two halves of a scalar can differ (the 7a `Wave` vote too: a half
+  with no entering lane skips the scalar writes the other runs). This is only equivalent for
+  programs indifferent to the wave size, which nothing checks. Nothing sets a required
+  subgroup size or full subgroups either, so a host may use partial or narrower subgroups,
+  and the invocation of a compute subgroup need not follow `LocalInvocationIndex` (it did in
+  the device test). Ways out: refuse such wave64 compute programs when the host is narrower;
+  `requiredSubgroupSize` 64 with full subgroups where the host offers it (AMD); the split
+  form elsewhere.
 - **Not done**: the lock-step run still requires every lane to take the same path and reads the
-  `Wave` vote as `Lane`; the device probe keeps `LocalSize` 1 (no per-lane comparison on a
-  device); the backend does not yet require the subgroup features and
-  `VK_KHR_shader_maximal_reconvergence` at device creation; scalar bits as masks still read
-  bit 0; no product reductions; sections that span blocks.
+  `Wave` vote as `Lane`; scalar bits as masks still read bit 0; no product reductions;
+  sections that span blocks.
 - **Corpus** (before = 7b head, after = 7c):
 
   | | IR | structure before | structure after | SPIR-V valid before | after |

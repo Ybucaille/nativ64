@@ -200,7 +200,14 @@ impl<'a> Tr<'a> {
     pub(super) fn lane_index(&mut self, wave32: bool) -> R<Option<u32>> {
         let tu = self.g.t_u32();
         match self.stage.as_ref().map(|s| s.io) {
-            None => Ok(Some(self.g.k(0))),
+            None => match self.wave_lanes {
+                None => Ok(Some(self.g.k(0))),
+                Some(_) => {
+                    let i = self.local_index();
+                    let mask = self.g.k(if wave32 { 31 } else { 63 });
+                    Ok(Some(self.g.op(Op::BitwiseAnd, tu, &[i, mask])))
+                }
+            },
             Some(StageIo::Compute(_)) => {
                 let i = self.load_builtin(BuiltIn::LocalInvocationIndex, tu);
                 let mask = self.g.k(if wave32 { 31 } else { 63 });
@@ -208,6 +215,27 @@ impl<'a> Tr<'a> {
             }
             Some(_) => Ok(None),
         }
+    }
+
+    /// `LocalInvocationIndex` of a wave probe, which has no stage to hold it.
+    pub(super) fn local_index(&mut self) -> u32 {
+        let tu = self.g.t_u32();
+        let var = match self.local_id {
+            Some(v) => v,
+            None => {
+                let p = self.g.t_ptr(StorageClass::Input, tu);
+                let v = self.g.m.global_var(p, StorageClass::Input, None);
+                self.g.m.decorate(
+                    v,
+                    Decoration::BuiltIn,
+                    &[BuiltIn::LocalInvocationIndex as u32],
+                );
+                self.extra_iface.push(v);
+                self.local_id = Some(v);
+                v
+            }
+        };
+        self.g.load(tu, var)
     }
 
     /// `SubgroupLocalInvocationId`: the host lane, whose low two bits are the lane of the quad.
