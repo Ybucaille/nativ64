@@ -323,7 +323,9 @@ impl<'g> GpuMemory<'g> {
             .collect();
         let ti = profile::start();
         let t0 = std::time::Instant::now();
+        let step = profile::step(profile::Step::Import);
         let imported = self.gpu.import_host(start as *mut u8, end - start);
+        drop(step);
         profile::stop(profile::Phase::Import, ti);
         profile::count(profile::Count::Imports, 1);
         profile::exec_since(profile::Exec::ImportNs, t0);

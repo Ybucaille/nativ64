@@ -87,6 +87,7 @@ impl<'g> VkBackend<'g> {
     /// Present `resource` (after the earlier submissions, which have completed): dump it, and
     /// blit `rect` of it (all when None) to `window`.
     pub fn present(&mut self, resource: usize, rect: Option<Rect>, window: Option<Window>) {
+        let _call = super::profile::call(true, super::profile::Step::Present);
         self.frames += 1;
         if self.frames.is_multiple_of(60) {
             super::profile::report(self.frames, 60);

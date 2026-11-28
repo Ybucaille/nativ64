@@ -30,7 +30,7 @@
 use super::bindless::{Bindless, Layouts};
 use super::format::{self, FormatInfo, FLAG_DEPTH_STENCIL, FLAG_RENDER_TARGET};
 use super::sampler::SamplerCache;
-use super::{log_once, Gpu};
+use super::{log_once, profile, Gpu};
 use crate::d3d12::pipeline::{GraphicsState, PipelineData};
 use crate::d3d12::pipeline_state::{fixed_state, Blend, FixedState, StencilFace};
 use crate::shader::io::{self, StageIo};
@@ -97,7 +97,12 @@ impl<'g> Pipelines<'g> {
         let gpu = self.gpu;
         let key = (pd.serial, rect, formats.to_vec());
         self.map.entry(key).or_insert_with(|| {
-            match build(gpu, bindless, samplers, pd, rect, formats) {
+            let _step = profile::step(profile::Step::Pipeline);
+            let t0 = std::time::Instant::now();
+            let built = build(gpu, bindless, samplers, pd, rect, formats);
+            profile::exec_add(profile::Exec::Pipelines, 1);
+            profile::exec_since(profile::Exec::PipelineNs, t0);
+            match built {
                 Ok(b) => Outcome::Built(b),
                 Err(why) => {
                     let kind = if rect { " as a rectangle list" } else { "" };

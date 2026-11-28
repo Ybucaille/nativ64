@@ -545,6 +545,7 @@ fn upload(
         profile::count(Count::Skipped, 1);
         return false;
     }
+    let _step = profile::step(profile::Step::Upload);
     let th = profile::start();
     let t0 = std::time::Instant::now();
     // SAFETY: the range lies in committed, accessible pages of the memory table.

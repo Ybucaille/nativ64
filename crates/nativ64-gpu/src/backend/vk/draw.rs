@@ -309,6 +309,7 @@ impl<'g> DrawState<'g> {
         let v = self.views.as_mut()?;
         if !self.views_ready {
             self.views_ready = true;
+            let _step = super::profile::step(super::profile::Step::Views);
             let t = super::profile::start();
             v.update(&mut self.mem);
             super::profile::stop(super::profile::Phase::Views, t);

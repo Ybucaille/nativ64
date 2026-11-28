@@ -369,6 +369,7 @@ impl<'g> VkBackend<'g> {
         let gpu = self.gpu;
         let t0 = std::time::Instant::now();
         super::profile::exec_take();
+        let _call = super::profile::call(false, super::profile::Step::Begin);
         let mut staging = Vec::new();
         self.reap();
         // draws and dispatches: each needs a root block, and the resources they read
@@ -390,6 +391,7 @@ impl<'g> VkBackend<'g> {
         let ts = super::profile::start();
         let t_sync = std::time::Instant::now();
         let mut passes = 0u32;
+        let step = super::profile::step(super::profile::Step::Sync);
         if draws > 0 {
             // what the draws can read gets an image; the rest stays out of device memory
             self.tex.wanted = super::residency::scan(lists, &mut self.tex.reads);
@@ -418,6 +420,8 @@ impl<'g> VkBackend<'g> {
         }
         super::profile::stop(super::profile::Phase::Sync, ts);
         let sync = t_sync.elapsed();
+        drop(step);
+        let _step = super::profile::step(super::profile::Step::Record);
         let t_record = std::time::Instant::now();
         let tr = super::profile::start();
         let r = gpu.submit_once(|d, cb| {

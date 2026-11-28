@@ -1,7 +1,7 @@
 //! Optional timing of the replay (`NATIV64_PROFILE=1`): the time spent in each phase of the
 //! submissions and a few counters, printed to stderr every 60 presented frames, then reset.
 
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering::Relaxed};
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -154,9 +154,13 @@ pub(super) enum Exec {
     UploadNs,
     /// Time spent waiting on submission fences.
     WaitNs,
+    /// Pipelines built (shader translation and Vulkan creation), and their time.
+    Pipelines,
+    PipelineNs,
 }
 
-static EXEC: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+const EXECS: usize = 8;
+static EXEC: [AtomicU64; EXECS] = [const { AtomicU64::new(0) }; EXECS];
 
 pub(super) fn exec_add(e: Exec, n: u64) {
     EXEC[e as usize].fetch_add(n, Relaxed);
@@ -168,7 +172,7 @@ pub(super) fn exec_since(e: Exec, since: Instant) {
 }
 
 /// The totals since the last call, reset.
-pub(super) fn exec_take() -> [u64; 6] {
+pub(super) fn exec_take() -> [u64; EXECS] {
     std::array::from_fn(|i| EXEC[i].swap(0, Relaxed))
 }
 
@@ -183,12 +187,13 @@ pub(super) fn slow_line(
     passes: u32,
     record: std::time::Duration,
     draws: usize,
-    took: [u64; 6],
+    took: [u64; EXECS],
 ) -> String {
     let ms = |ns: u64| ns as f64 / 1e6;
     format!(
         "slow execute {:.0} ms ({draws} draws): sync {:.0} ms in {passes} passes, record {:.0} ms; \
-         imports {} in {:.0} ms, uploads {} ({:.1} MB) in {:.0} ms, fence wait {:.0} ms",
+         imports {} in {:.0} ms, uploads {} ({:.1} MB) in {:.0} ms, pipelines {} in {:.0} ms, \
+         fence wait {:.0} ms",
         total.as_secs_f64() * 1e3,
         sync.as_secs_f64() * 1e3,
         record.as_secs_f64() * 1e3,
@@ -197,7 +202,160 @@ pub(super) fn slow_line(
         took[Exec::Uploads as usize],
         took[Exec::UploadBytes as usize] as f64 / 1e6,
         ms(took[Exec::UploadNs as usize]),
+        took[Exec::Pipelines as usize],
+        ms(took[Exec::PipelineNs as usize]),
         ms(took[Exec::WaitNs as usize]),
+    )
+}
+
+/// Where the call in the backend is, for the in-progress report: set at each boundary by a
+/// `Step` guard, which puts the outer step back when it ends.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub(super) enum Step {
+    Idle,
+    /// Before the texture sync: reaping, memory sync, view invalidation.
+    Begin,
+    /// The texture sync passes (uploads excluded).
+    Sync,
+    /// Hashing, detiling and staging one texture.
+    Upload,
+    /// Recording the lists (the steps below excluded).
+    Record,
+    /// The view table update.
+    Views,
+    /// One `import_host` call.
+    Import,
+    /// Building a pipeline (shader translation and Vulkan creation).
+    Pipeline,
+    /// Submitting to the queue.
+    Submit,
+    /// Waiting on a fence.
+    Wait,
+    /// A present (the steps above excluded).
+    Present,
+}
+
+const STEPS: [&str; 11] = [
+    "idle", "begin", "sync", "upload", "record", "views", "import", "pipeline", "submit", "wait",
+    "present",
+];
+
+impl Step {
+    fn name(self) -> &'static str {
+        STEPS[self as usize]
+    }
+    fn from(v: u8) -> Self {
+        [
+            Step::Idle,
+            Step::Begin,
+            Step::Sync,
+            Step::Upload,
+            Step::Record,
+            Step::Views,
+            Step::Import,
+            Step::Pipeline,
+            Step::Submit,
+            Step::Wait,
+            Step::Present,
+        ]
+        .get(v as usize)
+        .copied()
+        .unwrap_or(Step::Idle)
+    }
+}
+
+static STEP: AtomicU8 = AtomicU8::new(Step::Idle as u8);
+/// When the current call started (ms after `epoch()`, plus one; 0: no call), and which.
+static CALL_SINCE: AtomicU64 = AtomicU64::new(0);
+static CALL_KIND: AtomicU8 = AtomicU8::new(0);
+const CALLS: [&str; 2] = ["execute", "present"];
+/// How often the in-progress report looks, and logs while a call lasts.
+const REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn epoch() -> Instant {
+    static E: OnceLock<Instant> = OnceLock::new();
+    *E.get_or_init(Instant::now)
+}
+
+/// Sets the current step until the guard drops.
+pub(super) fn step(s: Step) -> StepGuard {
+    StepGuard(STEP.swap(s as u8, Relaxed))
+}
+
+pub(super) struct StepGuard(u8);
+
+impl Drop for StepGuard {
+    fn drop(&mut self) {
+        STEP.store(self.0, Relaxed);
+    }
+}
+
+/// Marks an `execute` (`present` false) or a present as in progress until the guard drops,
+/// at `first`; a host thread, started at the first call, logs every `REPORT_EVERY` while a call
+/// lasts longer than that.
+pub(super) fn call(present: bool, first: Step) -> CallGuard {
+    static WATCHER: OnceLock<()> = OnceLock::new();
+    WATCHER.get_or_init(|| {
+        let _ = std::thread::Builder::new()
+            .name("nativ64-gpu-watch".into())
+            .spawn(watch);
+    });
+    CALL_KIND.store(present as u8, Relaxed);
+    CALL_SINCE.store(epoch().elapsed().as_millis() as u64 + 1, Relaxed);
+    CallGuard { _step: step(first) }
+}
+
+pub(super) struct CallGuard {
+    _step: StepGuard,
+}
+
+impl Drop for CallGuard {
+    fn drop(&mut self) {
+        CALL_SINCE.store(0, Relaxed);
+    }
+}
+
+fn watch() {
+    loop {
+        std::thread::sleep(REPORT_EVERY);
+        let since = CALL_SINCE.load(Relaxed);
+        if since == 0 {
+            continue;
+        }
+        let ms = (epoch().elapsed().as_millis() as u64 + 1).saturating_sub(since);
+        if ms < REPORT_EVERY.as_millis() as u64 {
+            continue;
+        }
+        let took: [u64; EXECS] = std::array::from_fn(|i| EXEC[i].load(Relaxed));
+        eprintln!(
+            "nativ64-gpu: {}",
+            progress_line(
+                CALLS[CALL_KIND.load(Relaxed) as usize & 1],
+                ms,
+                Step::from(STEP.load(Relaxed)),
+                took
+            )
+        );
+    }
+}
+
+/// The line of a call in progress for `ms` milliseconds, at `step`, with the execute totals
+/// so far.
+fn progress_line(call: &str, ms: u64, step: Step, took: [u64; EXECS]) -> String {
+    let ms_of = |ns: u64| ns as f64 / 1e6;
+    format!(
+        "{call} in progress {:.0} s: phase={}, imports {} in {:.0} ms, uploads {} in {:.0} ms, \
+         pipelines {} in {:.0} ms, fence wait {:.0} ms",
+        ms as f64 / 1e3,
+        step.name(),
+        took[Exec::Imports as usize],
+        ms_of(took[Exec::ImportNs as usize]),
+        took[Exec::Uploads as usize],
+        ms_of(took[Exec::UploadNs as usize]),
+        took[Exec::Pipelines as usize],
+        ms_of(took[Exec::PipelineNs as usize]),
+        ms_of(took[Exec::WaitNs as usize]),
     )
 }
 
@@ -208,13 +366,15 @@ mod tests {
 
     #[test]
     fn a_slow_execute_line_gives_the_split() {
-        let mut took = [0u64; 6];
+        let mut took = [0u64; EXECS];
         took[Exec::Imports as usize] = 120;
         took[Exec::ImportNs as usize] = 900_000_000;
         took[Exec::Uploads as usize] = 3;
         took[Exec::UploadBytes as usize] = 4_500_000;
         took[Exec::UploadNs as usize] = 50_000_000;
         took[Exec::WaitNs as usize] = 7_000_000;
+        took[Exec::Pipelines as usize] = 5;
+        took[Exec::PipelineNs as usize] = 300_000_000;
         let line = slow_line(
             Duration::from_millis(1500),
             Duration::from_millis(400),
@@ -226,7 +386,27 @@ mod tests {
         assert_eq!(
             line,
             "slow execute 1500 ms (42 draws): sync 400 ms in 2 passes, record 1100 ms; \
-             imports 120 in 900 ms, uploads 3 (4.5 MB) in 50 ms, fence wait 7 ms"
+             imports 120 in 900 ms, uploads 3 (4.5 MB) in 50 ms, pipelines 5 in 300 ms, \
+             fence wait 7 ms"
         );
+    }
+
+    #[test]
+    fn a_progress_line_names_the_phase() {
+        let mut took = [0u64; EXECS];
+        took[Exec::Pipelines as usize] = 40;
+        took[Exec::PipelineNs as usize] = 6_000_000_000;
+        assert_eq!(
+            progress_line("execute", 6400, Step::Pipeline, took),
+            "execute in progress 6 s: phase=pipeline, imports 0 in 0 ms, uploads 0 in 0 ms, \
+             pipelines 40 in 6000 ms, fence wait 0 ms"
+        );
+    }
+
+    #[test]
+    fn step_names_match() {
+        for (i, n) in STEPS.iter().enumerate() {
+            assert_eq!(Step::from(i as u8).name(), *n);
+        }
     }
 }

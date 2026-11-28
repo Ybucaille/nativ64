@@ -446,6 +446,7 @@ impl Gpu {
             let cbs = [cb];
             let sub = [vk::SubmitInfo::default().command_buffers(&cbs)];
             let submitted = {
+                let _step = super::profile::step(super::profile::Step::Submit);
                 let q = self.queue.lock().unwrap();
                 vk_try("vkQueueSubmit", d.queue_submit(*q, &sub, fence))
             };
@@ -568,6 +569,7 @@ pub(super) unsafe fn wait_fence(
     what: &str,
 ) -> ash::prelude::VkResult<()> {
     let t0 = std::time::Instant::now();
+    let _step = super::profile::step(super::profile::Step::Wait);
     let r = loop {
         match d.wait_for_fences(&[fence], true, FENCE_PATIENCE_NS) {
             Err(vk::Result::TIMEOUT) => eprintln!(
