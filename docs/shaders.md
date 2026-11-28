@@ -546,17 +546,8 @@ operations in `spirv/emit.rs` and `spirv/emit/stage.rs`):
   program per subgroup feature is compared lane by lane with `interp_wave` on the backend's
   device (in CI, lavapipe). Passes with subgroups of 8 (lavapipe), 32 (NVIDIA) and 16 or
   narrower (Intel, which reports 32; the backend refuses it for another feature).
-- **Open: wave64 on a narrower host is not the console's result.** Votes, ballot counts,
-  `s_ff1`, `mbcnt` of a mask, reductions and scans cover one host subgroup. On 32 lanes a
-  64-lane sum gives each half its own sum, a prefix restarts at lane 32, `s_bcnt1` counts
-  half the mask, and the two halves of a scalar can differ (the 7a `Wave` vote too: a half
-  with no entering lane skips the scalar writes the other runs). This is only equivalent for
-  programs indifferent to the wave size, which nothing checks. Nothing sets a required
-  subgroup size or full subgroups either, so a host may use partial or narrower subgroups,
-  and the invocation of a compute subgroup need not follow `LocalInvocationIndex` (it did in
-  the device test). Ways out: refuse such wave64 compute programs when the host is narrower;
-  `requiredSubgroupSize` 64 with full subgroups where the host offers it (AMD); the split
-  form elsewhere.
+- Wave64 on a narrower host is not the console's result: such programs are refused where they
+  depend on the other lanes (Wave64 on narrower subgroups, below).
 - **Not done**: the lock-step run still requires every lane to take the same path and reads the
   `Wave` vote as `Lane`; scalar bits as masks still read bit 0; no product reductions;
   sections that span blocks.
@@ -579,6 +570,75 @@ operations in `spirv/emit.rs` and `spirv/emit/stage.rs`):
   into a VGPR and merged under lane-wise flow, so a sharper uniformity (or a host-wide
   broadcast-first with the `WaveReadLaneFirst` meaning) should be measured before XCL's split
   form.
+
+### Wave64 on narrower subgroups
+
+A subgroup operation covers the invocations of one host subgroup. On 32 lanes a 64-lane sum
+gives each half its own sum, a prefix restarts at lane 32, `s_bcnt1` counts half the mask, and
+the scalars of the two halves can differ. Correctness comes first: such programs are refused.
+
+**Rule** (`structure/dependence.rs`, `io::refuse_wave`). Translation takes the host's
+`subgroupSize` (`translate_stage`, `translate_pair`; part of the pipeline cache key). A program
+whose wave (32 or 64) is wider is `Unsupported` (the same path as every other gap, so the
+pipeline is not replayed and the log names the reason and the offset) when any stage of it has:
+
+| Depends on the wave: refused | Accepted on any size |
+|---|---|
+| lane count, first lane, rank of a mask (`s_bcnt1`, `s_ff1`, `mbcnt`) | quad operations (4 lanes of one subgroup everywhere) |
+| `v_readlane` of the lane a `s_ff1` found | `v_readlane` / `v_readfirstlane` of a value proved uniform (a copy), waterfall |
+| a mask compared with zero or a mask, unless both are wave-uniform | spill slots, the console lane index of compute |
+| reductions and scans | a min / max / and / or reduction or inclusive scan of a wave-uniform value |
+| the wave-wide branch of a speculated region (7a), unless its mask is wave-uniform | such a vote on a mask every lane of the wave agrees on (constants, all-ones EXEC) |
+
+A wave32 program is under the same rule on subgroups below 32 (lavapipe 8, some Intel
+stages). The probe modules of the tests (`translate`, `translate_wave`) are not subject to it.
+
+**Corpus** (`nativ64-shader --spirv --stats --subgroup <n>`, release, same 19101 blobs):
+
+| | structured | of them depending on the wave on 32 | SPIR-V valid on 64 | valid on 32 | refused |
+|---|---|---|---|---|---|
+| all | 13321 | 1318 | 3492 | 3429 | 63 |
+| cs | 1124 | 101 | 279 | 265 | 14 |
+| mesh | 5236 | 216 | 0 | 0 | 0 (all stop at `s_load`, chunk 9) |
+| ps | 5862 | 979 | 2665 | 2616 | 49 |
+| vs | 1099 | 22 | 548 | 548 | 0 |
+
+First dependence of the 1318 (block order): the wave-wide branch in 1297 (ps 969, mesh 216,
+cs 90, vs 22), a lane count in 10 (cs 6, ps 4), the first lane of a mask in 6 (ps), a
+reduction in 5 (cs). The 63 refused today are a floor: the others of the 1318 stop at another
+gap first and will be refused once it closes. A finer proof for the speculated branch (the
+scalars it changes read only by the lanes that entered) might accept some; not measured.
+
+**What the rule does not cover**
+
+- `subgroupSize` is the device's default, not a promise per pipeline. A device that reports 64
+  may run a stage at 32 (AMD compiles some stages wave32) and no pipeline asks for a size or
+  full subgroups yet: step 1 below closes it.
+- Compute lanes are assumed to follow `LocalInvocationIndex` inside a subgroup (they did in
+  the device test).
+- Width-independent approximations stay as they were: scalar bits used as lane masks read
+  bit 0 (7a).
+
+**Proposed fix (chunk 7d, to be approved)**
+
+1. **Required subgroup size** (`VK_EXT_subgroup_size_control`, core in 1.3): where the stage is
+   in `requiredSubgroupSizeStages` and `maxSubgroupSize` is 64 or more, ask for the program's
+   wave size, with full subgroups in compute. Little code and the host runs the program as
+   translated, for every stage. Only some hosts (AMD); a compute group whose X size is not a
+   multiple of 64 must be relinearised (`LocalSize` of the whole group, ids derived from the
+   index).
+2. **Split form** for compute and mesh elsewhere: one invocation carries console lanes `i`
+   and `i + 32`, on 32 full host lanes. Registers and masks become pairs; every vector and
+   memory instruction is emitted twice, each half under its own `active`; a per-lane branch is
+   taken when either half takes it, so flow goes back to predication; reductions combine the
+   halves first, prefixes add the low half's total to the high one, ballots give two words,
+   `v_readlane k` picks half `k / 32`. Exact, but a second emission mode with its own tests,
+   about twice the vector code and registers in each invocation (more VRAM for spills), and
+   `Proved` guards lost. Only wave-dependent programs would use it.
+3. **Pixel and vertex** cannot be split (the host composes their waves). Without a size of 64
+   they stay refused, unless it is accepted that a host subgroup behaves as a half-filled
+   wave64: the console does not fix which pixels share a wave, but this is **[unverified]** for
+   what the compiled programs assume.
 
 ## Inputs and outputs
 
