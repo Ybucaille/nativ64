@@ -491,3 +491,4 @@ c103febe	s_mov_b32 exec_lo, -1
 020069d501050202	v_mul_lo_u32 v2, v1, v2
 080061d7000a0102	v_writelane_b32 v8, s0, 5
 060060d7080b0102	v_readlane_b32 s6, v8, 5
+050065d7c1000102	v_mbcnt_lo_u32_b32 v5, -1, 0

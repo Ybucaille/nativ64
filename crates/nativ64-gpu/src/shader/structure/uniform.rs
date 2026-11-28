@@ -711,5 +711,14 @@ pub(super) fn lane_uses(f: &Func, m: &Masks, slots: &HashSet<u16>) -> HashMap<us
             }
         }
     }
+    // a ballot numbers the host's lanes: those numbers never meet a console lane index
+    if out.values().any(|u| matches!(u, LaneUse::LaneIndex { .. })) {
+        out.retain(|_, u| {
+            !matches!(
+                u,
+                LaneUse::FirstSet | LaneUse::ReadHostLane | LaneUse::Rank { .. }
+            )
+        });
+    }
     out
 }

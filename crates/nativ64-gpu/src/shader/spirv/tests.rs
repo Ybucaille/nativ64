@@ -2172,9 +2172,8 @@ fn loops_with_continue_break_and_deep_exit() {
 // ---------------------------------------------------------------------------------------
 // Chunk 7b: uniformity, spill slots, waterfall, console lane index (the wave evaluator)
 
-/// The wave evaluator: the program on each console lane of a wave. Lanes meet nowhere yet (the
-/// subgroup operations of chunk 7c are not emitted), so the host's subgroup width cannot change a
-/// result and is not a parameter; chunk 7c adds it with the first op that uses it.
+/// Each console lane of a wave on its own, for the programs whose lanes meet nowhere (a
+/// program with a subgroup operation runs in lock step: `lock`).
 fn wave(f: &Func, s: &Structured, lanes: u32, ins: impl Fn(u32) -> Vec<(Reg, u32)>) -> Vec<Out> {
     (0..lanes)
         .map(|l| interp_lane(f, s, &ins(l), l).unwrap())
@@ -4055,4 +4054,16 @@ fn a_spill_lane_reused_for_a_mask_and_a_dword_is_typed_per_read() {
     let got: Vec<u32> = out.iter().map(|o| get(o, Reg::V(1))).collect();
     assert_eq!(got, [0, 0, 0, 0, 1, 1, 1, 1]);
     assert!(out.iter().all(|o| get(o, Reg::V(4)) == 77));
+}
+
+#[test]
+fn host_lane_numbers_are_refused_beside_a_console_lane_index() {
+    assert_eq!(
+        first_cross_lane(&[
+            "v_mbcnt_lo_u32_b32 v5, -1, 0",
+            "v_cmp_lt_u32_e32 vcc_lo, 3, v0",
+            "v_mbcnt_lo_u32_b32 v3, vcc_lo, 0",
+        ]),
+        "v_mbcnt_lo_u32_b32"
+    );
 }
