@@ -27,6 +27,7 @@ pub mod api_ms_win_core_rtlsupport;
 pub mod api_ms_win_core_string;
 pub mod api_ms_win_core_synch;
 pub mod api_ms_win_core_sysinfo;
+pub mod api_ms_win_core_timezone;
 pub mod api_ms_win_core_util;
 pub mod api_ms_win_crt_convert;
 pub mod api_ms_win_crt_environment;
@@ -48,6 +49,7 @@ pub mod ext_ms_win_rtcore_ntuser_window_ansi;
 pub mod bcrypt;
 pub mod chad;
 pub mod com;
+mod filetime;
 pub mod gameinput;
 pub mod handles;
 mod log;
@@ -96,6 +98,7 @@ pub static TABLES: &[&[Export]] = &[
     api_ms_win_core_psm_appnotify::EXPORTS,
     api_ms_win_core_synch::EXPORTS,
     api_ms_win_core_sysinfo::EXPORTS,
+    api_ms_win_core_timezone::EXPORTS,
     api_ms_win_core_util::EXPORTS,
     api_ms_win_crt_convert::EXPORTS,
     api_ms_win_crt_environment::EXPORTS,

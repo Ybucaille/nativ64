@@ -146,6 +146,28 @@ unsafe fn transfer(
     }
 }
 
+/// Moves the FILETIME at `ft_in` by the local UTC offset (`direction` 1: UTC to local, -1: back)
+/// into `ft_out`, as `FileTimeToLocalFileTime` and its inverse do.
+unsafe fn convert_local(ft_in: *const u64, ft_out: *mut u64, direction: i64) -> i32 {
+    if ft_in.is_null() || ft_out.is_null() {
+        set_last_error(crate::handles::ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    // SAFETY: `ft_in` is a non-NULL FILETIME, possibly only 4-byte aligned.
+    let ft = unsafe { ft_in.read_unaligned() };
+    match crate::filetime::shift(ft, direction * crate::filetime::local_offset_now()) {
+        Some(moved) => {
+            // SAFETY: `ft_out` is a non-NULL FILETIME.
+            unsafe { ft_out.write_unaligned(moved) };
+            1
+        }
+        None => {
+            set_last_error(crate::handles::ERROR_INVALID_PARAMETER);
+            0
+        }
+    }
+}
+
 /// FILETIME (100 ns since 1601) of a Unix time.
 fn filetime(sec: i64, nsec: i64) -> u64 {
     const EPOCH_DIFF: i64 = 11_644_473_600;
@@ -488,6 +510,16 @@ fn status(r: Result<(), u32>) -> i32 {
 crate::win32! {
     module "api-ms-win-core-file" => "kernel32";
 
+    // The UTC FILETIME at `ft_in` as local time, with the bias in effect now (Windows ignores
+    // the date, daylight saving included). Fails when the result leaves the FILETIME range.
+    Native fn FileTimeToLocalFileTime(ft_in: *const u64, ft_out: *mut u64) -> i32 {
+        convert_local(ft_in, ft_out, 1)
+    }
+    // The inverse of `FileTimeToLocalFileTime`.
+    Native fn LocalFileTimeToFileTime(ft_in: *const u64, ft_out: *mut u64) -> i32 {
+        convert_local(ft_in, ft_out, -1)
+    }
+
     Native fn GetFileAttributesW(path: *const u16) -> u32 {
         match crate::handles::name_w(path) {
             Some(p) => attributes(&p),
@@ -736,6 +768,28 @@ crate::win32! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_file_times_shift_by_the_current_offset() {
+        let ft = 132_000_000_000_000_000u64;
+        let off = crate::filetime::local_offset_now() * 10_000_000;
+        let (mut local, mut back) = (0u64, 0u64);
+        unsafe {
+            assert_eq!(FileTimeToLocalFileTime(&ft, &mut local), 1);
+            assert_eq!(local as i64, ft as i64 + off);
+            assert_eq!(LocalFileTimeToFileTime(&local, &mut back), 1);
+            assert_eq!(back, ft);
+            // Out of range and NULL pointers fail with ERROR_INVALID_PARAMETER.
+            let top = 1u64 << 63;
+            set_last_error(0);
+            assert_eq!(FileTimeToLocalFileTime(&top, &mut local), 0);
+            assert_eq!(crate::api_ms_win_core_errorhandling::GetLastError(), 87);
+            set_last_error(0);
+            assert_eq!(LocalFileTimeToFileTime(std::ptr::null(), &mut local), 0);
+            assert_eq!(crate::api_ms_win_core_errorhandling::GetLastError(), 87);
+        }
+        assert!(crate::lookup("kernel32.dll", "FileTimeToLocalFileTime").is_some());
+    }
 
     #[test]
     fn attributes_of_dir_file_and_missing() {

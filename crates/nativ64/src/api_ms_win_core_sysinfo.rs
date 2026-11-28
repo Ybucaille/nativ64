@@ -5,8 +5,7 @@ use crate::topology::{
     RELATION_PROCESSOR_MODULE,
 };
 
-/// 100 ns intervals between 1601-01-01 and 1970-01-01.
-const UNIX_EPOCH_AS_FILETIME: u64 = 116_444_736_000_000_000;
+use crate::filetime::UNIX_EPOCH_AS_FILETIME;
 
 /// The current UTC time as a FILETIME value (100 ns intervals since 1601).
 fn filetime_now() -> u64 {
