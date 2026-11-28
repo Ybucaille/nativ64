@@ -394,7 +394,9 @@ impl<'g> VkBackend<'g> {
         let step = super::profile::step(super::profile::Step::Sync);
         if draws > 0 {
             // what the draws can read gets an image; the rest stays out of device memory
+            let prep = super::profile::exec_timer(super::profile::Exec::PrepNs);
             self.tex.wanted = super::residency::scan(lists, &mut self.tex.reads);
+            drop(prep);
             // The textures are synced in passes of at most `UPLOAD_CAP` staged bytes, each
             // submitted and waited for, so that the staging of a scene change's textures
             // does not pile up (pinned host memory) before the draws.
@@ -532,6 +534,8 @@ impl<'g> VkBackend<'g> {
         desc: ResourceDesc,
         address: u64,
     ) -> Option<TitleImage> {
+        let _t = super::profile::exec_timer(super::profile::Exec::ImageNs);
+        super::profile::exec_add(super::profile::Exec::Images, 1);
         if desc.dimension == TEXTURE1D {
             log_once("no image for a 1D texture".into());
             return None;
@@ -628,6 +632,7 @@ impl<'g> VkBackend<'g> {
             let req = d.get_image_memory_requirements(image);
             let mut mem = self.allocate_image_memory(d, &req);
             if mem.is_none() {
+                let _t = super::profile::exec_timer(super::profile::Exec::EvictNs);
                 // out of device memory: host-owned images not used by this submission are
                 // freed (they upload again when next made), oldest first
                 for victim in self.eviction_order() {
@@ -705,6 +710,7 @@ impl<'g> VkBackend<'g> {
         d: &Device,
         req: &vk::MemoryRequirements,
     ) -> Option<vk::DeviceMemory> {
+        let _t = super::profile::exec_timer(super::profile::Exec::AllocNs);
         #[cfg(test)]
         if let Some(budget) = self.budget {
             let live: u64 = self

@@ -528,6 +528,7 @@ fn upload(
         return false;
     }
     let (at, size) = (t.address as usize, layout.size as usize);
+    let tw = profile::exec_timer(Exec::WatchNs);
     if !table::is_committed(at, size) {
         log_once(format!(
             "texture memory {at:#x} (+{size:#x}) is not committed: not uploaded"
@@ -541,10 +542,12 @@ fn upload(
         && super::watch::written((at, at + size), &mut t.watched) == Some(false)
         && t.uploaded.is_some()
     {
+        drop(tw);
         stats.watch_skips += 1;
         profile::count(Count::Skipped, 1);
         return false;
     }
+    drop(tw);
     let _step = profile::step(profile::Step::Upload);
     let th = profile::start();
     let t0 = std::time::Instant::now();
@@ -679,6 +682,7 @@ impl<'g> VkBackend<'g> {
         let desc = placed_desc(&key.1);
         let made = self.make_image(d, cb, desc, key.0);
         if let Some(t) = &made {
+            let _t = profile::exec_timer(Exec::OverlapNs);
             let size = t.layout.as_ref().map_or(1, |l| l.size);
             let (a, b) = (key.0, key.0.saturating_add(size));
             let overlaps = self.images.values().flatten().any(|g| {
@@ -1060,6 +1064,7 @@ impl<'g> VkBackend<'g> {
         let Some(count) = self.draw.bindless().map(|b| b.count as usize) else {
             return;
         };
+        let prep = profile::exec_timer(Exec::PrepNs);
         // 1. the registry indices that got a view or lost theirs since the last time
         let changed = self.tex.changes.get_or_insert_with(Consumer::new).changes();
         if let Some(&(last, _)) = changed.last() {
@@ -1105,6 +1110,7 @@ impl<'g> VkBackend<'g> {
         resources.dedup();
         placed.sort_unstable();
         placed.dedup();
+        drop(prep);
         let th = profile::start();
         for res in resources {
             uploaded |= self.host_upload(d, cb, res);
@@ -1128,7 +1134,11 @@ impl<'g> VkBackend<'g> {
         for res in storage {
             self.own(res);
         }
-        self.trim();
+        {
+            let _t = profile::exec_timer(Exec::EvictNs);
+            self.trim();
+        }
+        let _descr = profile::exec_timer(Exec::DescrNs);
         // 3. descriptors: the changed entries (image and sampler), then the image of the
         // indices whose image changed, and of those the draws read whose view is not the one
         // written

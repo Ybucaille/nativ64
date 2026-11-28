@@ -157,9 +157,26 @@ pub(super) enum Exec {
     /// Pipelines built (shader translation and Vulkan creation), and their time.
     Pipelines,
     PipelineNs,
+    /// Images made (`make_image`) and their time, of which device memory allocation and the
+    /// evictions that made room (in `make_image` and `trim`).
+    Images,
+    ImageNs,
+    AllocNs,
+    EvictNs,
+    /// The write-watch steps of the uploads (commit checks, registration, scans), of which
+    /// the alias check (`xmem::is_aliased`, pool lock wait included).
+    WatchNs,
+    AliasNs,
+    /// The overlap check of new placed images against the GPU-written ones.
+    OverlapNs,
+    /// The sync's preparation: residency scan of the lists and classification of the
+    /// changed registry entries.
+    PrepNs,
+    /// Descriptor writes of the sync (views made included).
+    DescrNs,
 }
 
-const EXECS: usize = 8;
+const EXECS: usize = 17;
 static EXEC: [AtomicU64; EXECS] = [const { AtomicU64::new(0) }; EXECS];
 
 pub(super) fn exec_add(e: Exec, n: u64) {
@@ -169,6 +186,19 @@ pub(super) fn exec_add(e: Exec, n: u64) {
 /// Adds the time since `since` to `e`.
 pub(super) fn exec_since(e: Exec, since: Instant) {
     exec_add(e, since.elapsed().as_nanos() as u64);
+}
+
+/// Adds the time until it drops to `e` (early returns included).
+pub(super) struct ExecTimer(Exec, Instant);
+
+pub(super) fn exec_timer(e: Exec) -> ExecTimer {
+    ExecTimer(e, Instant::now())
+}
+
+impl Drop for ExecTimer {
+    fn drop(&mut self) {
+        exec_since(self.0, self.1);
+    }
 }
 
 /// The totals since the last call, reset.
@@ -193,7 +223,8 @@ pub(super) fn slow_line(
     format!(
         "slow execute {:.0} ms ({draws} draws): sync {:.0} ms in {passes} passes, record {:.0} ms; \
          imports {} in {:.0} ms, uploads {} ({:.1} MB) in {:.0} ms, pipelines {} in {:.0} ms, \
-         fence wait {:.0} ms",
+         fence wait {:.0} ms; sync split: prep {:.0} ms, images {} in {:.0} ms (alloc {:.0} ms, \
+         evict {:.0} ms), overlap {:.0} ms, watch {:.0} ms (alias {:.0} ms), descr {:.0} ms",
         total.as_secs_f64() * 1e3,
         sync.as_secs_f64() * 1e3,
         record.as_secs_f64() * 1e3,
@@ -205,6 +236,15 @@ pub(super) fn slow_line(
         took[Exec::Pipelines as usize],
         ms(took[Exec::PipelineNs as usize]),
         ms(took[Exec::WaitNs as usize]),
+        ms(took[Exec::PrepNs as usize]),
+        took[Exec::Images as usize],
+        ms(took[Exec::ImageNs as usize]),
+        ms(took[Exec::AllocNs as usize]),
+        ms(took[Exec::EvictNs as usize]),
+        ms(took[Exec::OverlapNs as usize]),
+        ms(took[Exec::WatchNs as usize]),
+        ms(took[Exec::AliasNs as usize]),
+        ms(took[Exec::DescrNs as usize]),
     )
 }
 
@@ -375,6 +415,11 @@ mod tests {
         took[Exec::WaitNs as usize] = 7_000_000;
         took[Exec::Pipelines as usize] = 5;
         took[Exec::PipelineNs as usize] = 300_000_000;
+        took[Exec::Images as usize] = 9;
+        took[Exec::ImageNs as usize] = 80_000_000;
+        took[Exec::AllocNs as usize] = 60_000_000;
+        took[Exec::WatchNs as usize] = 20_000_000;
+        took[Exec::AliasNs as usize] = 10_000_000;
         let line = slow_line(
             Duration::from_millis(1500),
             Duration::from_millis(400),
@@ -387,7 +432,8 @@ mod tests {
             line,
             "slow execute 1500 ms (42 draws): sync 400 ms in 2 passes, record 1100 ms; \
              imports 120 in 900 ms, uploads 3 (4.5 MB) in 50 ms, pipelines 5 in 300 ms, \
-             fence wait 7 ms"
+             fence wait 7 ms; sync split: prep 0 ms, images 9 in 80 ms (alloc 60 ms, evict 0 ms), \
+             overlap 0 ms, watch 20 ms (alias 10 ms), descr 0 ms"
         );
     }
 

@@ -303,7 +303,10 @@ pub(super) fn written(range: (usize, usize), cursor: &mut Cursor) -> Option<bool
     let t = profile::start();
     let (start, end) = (range.0 & !(PAGE - 1), range.1.next_multiple_of(PAGE));
     let answer = with(|w| {
-        if !w.covered(start, end) || crate::xmem::is_aliased(start, end) {
+        if !w.covered(start, end) || {
+            let _t = profile::exec_timer(profile::Exec::AliasNs);
+            crate::xmem::is_aliased(start, end)
+        } {
             return None;
         }
         w.epoch += 1;
