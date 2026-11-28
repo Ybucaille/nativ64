@@ -182,6 +182,8 @@ pub struct Func {
     pub vals: Vec<ValInfo>,
     /// The entry values, by register.
     pub args: Vec<(Reg, Val)>,
+    /// The entry registers whose value is the same in every lane (`EntryRegs::uniform_vgprs`).
+    pub uniform_args: Vec<Reg>,
     /// Immediate dominators (`None` for the entry).
     pub idom: Vec<Option<BlockId>>,
     /// Reverse post-order from the entry.
@@ -208,6 +210,8 @@ pub struct EntryRegs {
     /// routine (`s_swappc_b64 s[4:5], s[4:5]`) the call becomes an instruction that defines
     /// them; otherwise they are not entry registers.
     pub fetch: Option<Vec<u16>>,
+    /// Entry VGPRs the stage table marks wave-uniform (mesh `v5`): the same in every lane.
+    pub uniform_vgprs: Vec<Range<u16>>,
 }
 
 /// Dwords each `SPI_PS_INPUT_ADDR` bit takes, in bit order: the barycentric pairs (the pull
@@ -244,6 +248,12 @@ impl EntryRegs {
 
     pub fn with_vgprs(mut self, r: Range<u16>) -> Self {
         self.vgprs.push(r);
+        self
+    }
+
+    /// Marks entry VGPRs as holding the same value in every lane.
+    pub fn with_uniform_vgprs(mut self, r: Range<u16>) -> Self {
+        self.uniform_vgprs.push(r);
         self
     }
 
@@ -309,7 +319,8 @@ impl EntryRegs {
                 r = r
                     .with_sgprs(3..4)
                     .with_sgprs(8..8 + u16::from(d.user_sgprs))
-                    .with_vgprs(5..6);
+                    .with_vgprs(5..6)
+                    .with_uniform_vgprs(5..6);
             }
         }
         r
@@ -1867,6 +1878,14 @@ impl Builder<'_> {
             entry: entry_id,
             vals: std::mem::take(&mut self.vals),
             args: self.args.iter().map(|(r, v)| (*r, *v)).collect(),
+            uniform_args: self
+                .args
+                .keys()
+                .copied()
+                .filter(|r| {
+                    matches!(r, Reg::V(n) if self.regs.uniform_vgprs.iter().any(|u| u.contains(n)))
+                })
+                .collect(),
             idom: (0..n)
                 .map(|b| if b == entry_id { None } else { idom[b] })
                 .collect(),

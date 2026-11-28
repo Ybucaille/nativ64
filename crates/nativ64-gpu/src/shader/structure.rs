@@ -21,6 +21,10 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 
+mod uniform;
+use uniform::narrows;
+pub use uniform::{Dom, LaneUse};
+
 use super::gfx10::{Enc, Instr, Operand};
 use super::ir::{dominators, BlockId, Func, Inst, Reg, Src, Term, Val, ValDef};
 
@@ -208,11 +212,26 @@ pub struct Masks {
     pub within: HashMap<Val, Val>,
     /// Every use that crosses lanes, in program order.
     pub cross_lane: Vec<CrossLane>,
+    /// By `Val`: the lanes the value is the same in (everything that is not a mask or a VGPR
+    /// counts as uniform over all of them).
+    pub uniform_vals: Vec<Option<Dom>>,
+    /// VGPRs that only spill SGPRs into lanes (`v_writelane` / `v_readlane` at constant lanes).
+    pub slots: HashSet<u16>,
+    /// The wave instructions items 1-4 of the chunk 7 design give a meaning to, by the byte
+    /// offset of the instruction. They are not in `cross_lane`.
+    pub lanes: HashMap<usize, LaneUse>,
 }
 
 impl Masks {
     pub fn is_mask(&self, v: Val) -> bool {
         self.masks.contains(&v)
+    }
+
+    /// The value is the same in every active lane.
+    pub fn is_uniform(&self, v: Val) -> bool {
+        self.uniform_vals
+            .get(v.0 as usize)
+            .is_some_and(Option::is_some)
     }
 
     /// A mask, or one of the constants 0 / -1.
@@ -321,13 +340,12 @@ pub fn type_masks(f: &Func) -> Masks {
         }
     }
     uniform_masks(f, &mut m);
+    m.uniform_vals = uniform::uniform_vals(f, &m);
+    m.slots = uniform::slot_vgprs(f, &m);
+    m.lanes = uniform::lane_uses(f, &m, &m.slots);
     for blk in &f.blocks {
         for inst in &blk.insts {
             if let Some(name) = cross_lane_use(&m, inst) {
-                // `v_readfirstlane` of a value every lane holds is a copy.
-                if uniform_readfirstlane(f, &m, inst) {
-                    continue;
-                }
                 m.cross_lane.push(CrossLane {
                     at: inst.instr.at,
                     name,
@@ -341,18 +359,6 @@ pub fn type_masks(f: &Func) -> Masks {
 /// Fills `m.uniform`. Definitions dominate uses, so one pass in reverse post-order suffices;
 /// a phi is never uniform (the lanes may reach it by different paths).
 fn uniform_masks(f: &Func, m: &mut Masks) {
-    // `a` is `b` or narrows it
-    fn narrows(m: &Masks, mut a: Val, b: Val) -> bool {
-        loop {
-            if a == b {
-                return true;
-            }
-            match m.within.get(&a) {
-                Some(&n) => a = n,
-                None => return false,
-            }
-        }
-    }
     for &(r, v) in &f.args {
         if is_exec(r) {
             m.uniform.insert(v, Some(v));
@@ -434,68 +440,12 @@ fn uniform_masks(f: &Func, m: &mut Masks) {
     }
 }
 
-/// Whether the VGPR value `v` is the same in every lane over the active lanes (the strict test of the wave survey).
-pub fn wave_uniform(f: &Func, m: &Masks, v: Val, seen: &mut HashSet<Val>) -> bool {
-    use crate::shader::gfx10::Enc;
-    use crate::shader::ir::{Reg, Src, ValDef};
-    if !seen.insert(v) {
-        return true;
-    }
-    if m.is_mask(v) {
-        return false;
-    }
-    let info = f.vals[v.0 as usize];
-    if !matches!(info.reg, Reg::V(_)) {
-        return matches!(info.reg, Reg::S(_) | Reg::T(_) | Reg::M0);
-    }
-    let src_ok = |s: &Src, seen: &mut HashSet<_>| match s {
-        Src::Val(x) => wave_uniform(f, m, *x, seen),
-        _ => true,
-    };
-    match info.def {
-        ValDef::Arg => false,
-        ValDef::Phi { block, index } => {
-            let phi = &f.blocks[block].phis[index];
-            phi.args.iter().all(|(_, s)| src_ok(s, seen))
-        }
-        ValDef::Inst { block, index } => {
-            let inst = &f.blocks[block].insts[index];
-            let i = &inst.instr;
-            let n = i.name();
-            if n.starts_with("v_readfirstlane") || n.starts_with("v_readlane") {
-                return true;
-            }
-            let alu = matches!(
-                i.enc,
-                Enc::Vop1 | Enc::Vop2 | Enc::Vop3 | Enc::Vop3p | Enc::Vopc
-            );
-            if !alu
-                || i.dpp.is_some()
-                || n.starts_with("v_mbcnt")
-                || n.starts_with("v_permlane")
-                || n.starts_with("v_writelane")
-            {
-                return false;
-            }
-            inst.srcs.iter().flatten().all(|s| src_ok(s, seen))
-        }
-    }
-}
-
-/// A `v_readfirstlane` whose source is the same in every lane: a plain copy, no lane exchange.
-fn uniform_readfirstlane(f: &Func, m: &Masks, inst: &Inst) -> bool {
-    inst.instr.name().starts_with("v_readfirstlane")
-        && inst.instr.dpp.is_none()
-        && match inst.srcs.first().and_then(|v| v.first()) {
-            Some(Src::Val(v)) => wave_uniform(f, m, *v, &mut HashSet::new()),
-            Some(_) => true,
-            None => false,
-        }
-}
-
 /// The name under which `inst` crosses lanes, when it does.
 pub fn cross_lane_use(m: &Masks, inst: &Inst) -> Option<String> {
     let i = &inst.instr;
+    if m.lanes.contains_key(&i.at) {
+        return None;
+    }
     if i.dpp.is_some() {
         return Some(format!("{} (dpp)", i.name()));
     }
@@ -632,7 +582,8 @@ fn divergent_scalar(
             continue;
         };
         for p in &f.blocks[j].phis {
-            if matches!(p.reg, Reg::V(_)) || m.is_mask(p.dst) {
+            let slot = matches!(p.reg, Reg::V(k) if m.slots.contains(&k));
+            if (matches!(p.reg, Reg::V(_)) && !slot) || m.is_mask(p.dst) {
                 continue;
             }
             let first = p.args.first().map(|(_, s)| *s);

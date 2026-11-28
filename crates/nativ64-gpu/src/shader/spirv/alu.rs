@@ -8,7 +8,7 @@
 //! values, to ask whether an opcode is supported.
 
 use crate::shader::gfx10::{Enc, Instr, Mods, Sdwa};
-use crate::shader::ir::{Inst, Reg};
+use crate::shader::ir::{Inst, Reg, Src};
 
 /// An instruction the translator does not emit yet: `chunk` is the plan chunk that adds it
 /// (6 for an ALU opcode this chunk leaves out, 7 wave operations, 8 I/O, 9 memory).
@@ -174,6 +174,9 @@ pub struct Ctx<'a, K: Backend> {
     /// A vector instruction EXEC is not proved set for: this lane's EXEC bit. `None` runs it
     /// unconditionally.
     pub active: Option<K::B>,
+    /// The console lane index of this invocation (`LocalInvocationIndex` modulo the wave
+    /// size; 0 in the probe). `None` where a stage cannot tell it (vertex, pixel).
+    pub lane: Option<K::V>,
 }
 
 /// The plan chunk an instruction that is not ALU belongs to, `None` for the ALU ones.
@@ -204,6 +207,15 @@ pub fn non_alu_chunk(i: &Instr) -> Option<u8> {
         _ if n.starts_with("v_interp") => Some(8),
         _ => None,
     }
+}
+
+/// The wave instructions the structurer vets and `exec` runs per lane: a `v_readfirstlane` /
+/// `v_readlane` of a uniform value or a waterfall index is a copy, `v_mbcnt` of -1 is the
+/// console lane index. (Spill slots are handled by the emitter, before the table.)
+fn is_wave_exempt(name: &str) -> bool {
+    name.starts_with("v_readfirstlane")
+        || name.starts_with("v_readlane")
+        || name.starts_with("v_mbcnt")
 }
 
 // ---------------------------------------------------------------------------------------
@@ -512,7 +524,7 @@ pub fn exec<K: Backend>(b: &mut K, c: &Ctx<K>) -> Result<Vec<Opd<K>>, Unsupporte
     let i = &c.inst.instr;
     let name = i.name();
     // The structurer only lets a `v_readfirstlane` through when its source is uniform: a copy.
-    if let Some(chunk) = non_alu_chunk(i).filter(|_| !name.starts_with("v_readfirstlane")) {
+    if let Some(chunk) = non_alu_chunk(i).filter(|_| !is_wave_exempt(name)) {
         return Err(Unsupported {
             chunk,
             op: name.to_string(),
@@ -1949,7 +1961,34 @@ impl<K: Backend> X<'_, K> {
         let name = self.name;
         match name {
             // -- moves and bit operations
-            "v_mov_b32" | "v_readfirstlane_b32" => Ok(Res::v(self.v(0)?)),
+            "v_mov_b32" | "v_readfirstlane_b32" | "v_readlane_b32" => Ok(Res::v(self.v(0)?)),
+            // the console lane index: `mbcnt(-1, x)` counts the lanes below this one
+            "v_mbcnt_lo_u32_b32" | "v_mbcnt_hi_u32_b32" => {
+                if self.c.inst.srcs[0].first() != Some(&Src::Const(u32::MAX)) {
+                    // the count of a real mask: a ballot (chunk 7c)
+                    return Err(Unsupported {
+                        chunk: 7,
+                        op: format!("{name} of a mask"),
+                    });
+                }
+                let Some(lane) = self.c.lane else {
+                    return Err(Unsupported {
+                        chunk: 7,
+                        op: format!("{name} (the lane index of a vertex or pixel program)"),
+                    });
+                };
+                let x = self.v(1)?;
+                let c32 = self.k(32);
+                let r = if name == "v_mbcnt_lo_u32_b32" {
+                    let l = self.b.ibin(IBin::UMin, lane, c32);
+                    self.b.ibin(IBin::Add, l, x)
+                } else {
+                    let l = self.b.ibin(IBin::UMax, lane, c32);
+                    let l = self.b.ibin(IBin::Sub, l, c32);
+                    self.b.ibin(IBin::Add, l, x)
+                };
+                Ok(Res::v(r))
+            }
             "v_not_b32" => {
                 let a = self.v(0)?;
                 Ok(Res::v(self.b.iun(IUn::Not, a)))
@@ -2479,6 +2518,7 @@ pub fn supported(inst: &Inst) -> Result<(), Unsupported> {
         imps: inst.imps.iter().map(|(r, _)| (*r, Opd::V(()))).collect(),
         dst_mask: vec![false; inst.dsts.len()],
         active: None,
+        lane: Some(()),
     };
     exec(&mut Dry, &ctx).map(|_| ())
 }

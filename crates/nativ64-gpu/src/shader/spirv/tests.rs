@@ -7,7 +7,7 @@ use super::alu::{exec, Cpu, Ctx, Opd, Unsupported};
 use super::emit::{translate, Probe, SpirvError};
 use super::gpu::{self, Gpu, Run};
 use crate::shader::ir::{build, EntryRegs, Func, Reg, Src, Term, Val};
-use crate::shader::structure::{structure, BranchKind, Guard, Structured};
+use crate::shader::structure::{structure, BranchKind, Guard, LaneUse, Structured};
 
 // Test programs are `fixtures.txt`: `hex<TAB>text` pairs, the text being what
 // `llvm-mc -arch=amdgcn -mcpu=gfx1013 -mattr=+wavefrontsize32 -show-encoding` assembled to that
@@ -84,6 +84,15 @@ fn nonzero(o: Opd<Cpu>) -> bool {
 }
 
 fn interp(f: &Func, s: &Structured, ins: &[(Reg, u32)]) -> Result<Out, SpirvError> {
+    interp_lane(f, s, ins, 0)
+}
+
+/// One console lane of the program: `lane` is its lane index (what `v_mbcnt(-1, .)` counts).
+/// The wave evaluator runs it for each lane of the wave; lanes meet nowhere (the subgroup
+/// operations of chunk 7c are not emitted yet), so a lane's result does not depend on the
+/// others.
+fn interp_lane(f: &Func, s: &Structured, ins: &[(Reg, u32)], lane: u32) -> Result<Out, SpirvError> {
+    let mut slots: HashMap<(u16, u8), u32> = HashMap::new();
     let mut env: HashMap<Val, Opd<Cpu>> = HashMap::new();
     let mut out = Out::new();
     for &(reg, val) in &f.args {
@@ -108,6 +117,19 @@ fn interp(f: &Func, s: &Structured, ins: &[(Reg, u32)]) -> Result<Out, SpirvErro
             out.insert((reg, s.masks.is_mask(dst)), as_u32(o));
         }
         for (k, i) in blk.insts.iter().enumerate() {
+            match s.masks.lanes.get(&i.instr.at) {
+                Some(&LaneUse::SlotWrite { vgpr, lane }) => {
+                    slots.insert((vgpr, lane), as_u32(rd(&env, i.srcs[0][0])?));
+                    continue;
+                }
+                Some(&LaneUse::SlotRead { vgpr, lane }) => {
+                    let x = slots.get(&(vgpr, lane)).copied().unwrap_or(0);
+                    env.insert(i.dsts[0].1, Opd::V(x));
+                    out.insert((i.dsts[0].0, false), x);
+                    continue;
+                }
+                _ => {}
+            }
             let srcs = i
                 .srcs
                 .iter()
@@ -143,6 +165,7 @@ fn interp(f: &Func, s: &Structured, ins: &[(Reg, u32)]) -> Result<Out, SpirvErro
                 imps,
                 dst_mask: i.dsts.iter().map(|(_, v)| s.masks.is_mask(*v)).collect(),
                 active,
+                lane: Some(lane),
             };
             let res = exec(&mut Cpu, &ctx)?;
             for ((reg, val), o) in i.dsts.iter().zip(res) {
@@ -1908,6 +1931,242 @@ fn loops_with_continue_break_and_deep_exit() {
     // the two-level exit translates and validates
     let fun = words(&BREAK2);
     module_of(&fun).unwrap();
+}
+
+// ---------------------------------------------------------------------------------------
+// Chunk 7b: uniformity, spill slots, waterfall, console lane index (the wave evaluator)
+
+/// The wave evaluator: the program on each console lane of a wave. Lanes meet nowhere yet (the
+/// subgroup operations of chunk 7c are not emitted), so the host's subgroup width cannot change a
+/// result and is not a parameter; chunk 7c adds it with the first op that uses it.
+fn wave(f: &Func, s: &Structured, lanes: u32, ins: impl Fn(u32) -> Vec<(Reg, u32)>) -> Vec<Out> {
+    (0..lanes)
+        .map(|l| interp_lane(f, s, &ins(l), l).unwrap())
+        .collect()
+}
+
+fn wave_ok(lines: &[&str]) -> (Func, Structured) {
+    let fun = func(lines);
+    let s = structure(&fun).unwrap_or_else(|e| panic!("{e}"));
+    assert!(s.masks.cross_lane.is_empty(), "{:?}", s.masks.cross_lane);
+    (fun, s)
+}
+
+fn first_cross_lane(lines: &[&str]) -> String {
+    let fun = func(lines);
+    let m = crate::shader::structure::type_masks(&fun);
+    m.cross_lane
+        .first()
+        .map(|c| c.name.clone())
+        .unwrap_or_default()
+}
+
+#[test]
+fn spill_slots_are_one_scalar_per_lane_used() {
+    let lines = [
+        "[w64] v_writelane_b32 v8, s0, 3",
+        "[w64] v_writelane_b32 v8, s1, 40",
+        "[w64] v_readlane_b32 s2, v8, 40",
+        "[w64] v_readlane_b32 s3, v8, 3",
+        "[w64] v_readlane_b32 s4, v8, 7",
+    ];
+    let (fun, s) = wave_ok(&lines);
+    assert_eq!(s.masks.slots.iter().copied().collect::<Vec<_>>(), [8]);
+    let p = translate(&fun, &s).unwrap();
+    validate(&p.words);
+    // a slot never written reads 0; every lane sees the same slots
+    for o in wave(&fun, &s, 64, |l| vec![(S0, 100 + l), (S1, 200)]) {
+        assert_eq!(get(&o, S2), 200);
+        assert_eq!(get(&o, S3), o[&(S3, false)]);
+        assert_eq!(get(&o, S4), 0);
+    }
+    let outs = wave(&fun, &s, 4, |l| vec![(S0, 100 + l), (S1, 200)]);
+    assert_eq!(
+        outs.iter().map(|o| get(o, S3)).collect::<Vec<_>>(),
+        [100, 101, 102, 103]
+    );
+}
+
+#[test]
+fn a_vgpr_used_for_more_than_spills_is_not_a_slot() {
+    // read as a vector: still a lane exchange
+    assert_eq!(
+        first_cross_lane(&[
+            "[w64] v_writelane_b32 v8, s0, 3",
+            "[w64] v_mov_b32 v3, v8",
+            "[w64] v_readlane_b32 s3, v8, 3",
+        ]),
+        "v_writelane_b32"
+    );
+    // read at a lane that is not a constant
+    assert_eq!(
+        first_cross_lane(&[
+            "[w64] v_writelane_b32 v8, s0, 3",
+            "[w64] v_readlane_b32 s4, v8, s5",
+        ]),
+        "v_writelane_b32"
+    );
+}
+
+#[test]
+fn the_console_lane_index_is_not_the_hosts() {
+    let lines = [
+        "[w64] v_mbcnt_lo_u32_b32 v9, -1, 5",
+        "[w64] v_mbcnt_hi_u32_b32 v9, -1, v9",
+    ];
+    let (fun, s) = wave_ok(&lines);
+    let p = translate(&fun, &s).unwrap();
+    validate(&p.words);
+    // lo = min(lane, 32) + x, hi adds max(lane, 32) - 32: together lane + x
+    for (l, o) in wave(&fun, &s, 64, |_| vec![]).iter().enumerate() {
+        assert_eq!(get(o, Reg::V(9)), l as u32 + 5, "lane {l}");
+    }
+    let (fun, s) = wave_ok(&["[w64] v_mbcnt_lo_u32_b32 v9, -1, 0"]);
+    let v: Vec<u32> = wave(&fun, &s, 64, |_| vec![])
+        .iter()
+        .map(|o| get(o, Reg::V(9)))
+        .collect();
+    assert_eq!(v[31], 31);
+    assert_eq!(v[32], 32);
+    assert_eq!(v[63], 32);
+    // the count of a real mask is a ballot (7c)
+    assert_eq!(
+        first_cross_lane(&["[w64] v_mbcnt_lo_u32_b32 v9, s0, 0"]),
+        "v_mbcnt_lo_u32_b32"
+    );
+}
+
+#[test]
+fn a_probe_has_no_lane_index_in_a_vertex_or_pixel_program() {
+    // the ALU table asks the stage for the lane: none gives the unsupported error by name
+    let fun = func(&["[w64] v_mbcnt_lo_u32_b32 v9, -1, 0"]);
+    let i = &fun.blocks[0].insts[0];
+    let ctx = Ctx {
+        inst: i,
+        srcs: vec![vec![Opd::V(u32::MAX)], vec![Opd::V(0)]],
+        imps: vec![],
+        dst_mask: vec![false],
+        active: None,
+        lane: None,
+    };
+    match exec(&mut Cpu, &ctx) {
+        Err(Unsupported { chunk: 7, op }) => assert!(op.contains("lane index"), "{op}"),
+        r => panic!("{:?}", r.map(|_| ())),
+    }
+}
+
+#[test]
+fn readfirstlane_and_readlane_of_a_uniform_value_are_copies() {
+    let lines = [
+        "[w64] v_mov_b32 v9, s0",
+        "[w64] v_readfirstlane_b32 s5, v9",
+        "[w64] v_readlane_b32 s6, v9, 5",
+    ];
+    let (fun, s) = wave_ok(&lines);
+    for o in wave(&fun, &s, 64, |l| vec![(S0, 77), (V0, l)]) {
+        assert_eq!((get(&o, Reg::S(5)), get(&o, S6)), (77, 77));
+    }
+    // a per-lane value (the thread id) is a lane exchange
+    assert_eq!(
+        first_cross_lane(&["[w64] v_readfirstlane_b32 s5, v0"]),
+        "v_readfirstlane_b32"
+    );
+    assert_eq!(
+        first_cross_lane(&["[w64] v_readlane_b32 s5, v0, 5"]),
+        "v_readlane_b32"
+    );
+}
+
+#[test]
+fn a_write_under_a_narrowed_exec_keeps_the_old_lanes_values() {
+    // v1 holds a per-lane value on entry; the mov under `v_cmp` + `s_and_saveexec` changes only
+    // some lanes, so after the restore v1 is not uniform
+    let lines = [
+        "[w64] v_cmp_lt_u32 vcc, v0, v1",
+        "[w64] s_and_saveexec_b64 s[2:3], vcc",
+        "[w64] v_mov_b32 v1, s0",
+        "[w64] s_mov_b64 exec, s[2:3]",
+        "[w64] v_readfirstlane_b32 s5, v1",
+    ];
+    assert_eq!(first_cross_lane(&lines), "v_readfirstlane_b32");
+    // under the entry EXEC every lane takes the new value
+    let (fun, s) = wave_ok(&["[w64] v_mov_b32 v1, s0", "[w64] v_readfirstlane_b32 s5, v1"]);
+    for o in wave(&fun, &s, 8, |l| vec![(S0, 9), (V1, l)]) {
+        assert_eq!(get(&o, Reg::S(5)), 9);
+    }
+}
+
+#[test]
+fn a_waterfall_readfirstlane_takes_the_lanes_own_value() {
+    let lines = [
+        "[w64] v_readfirstlane_b32 s5, v2",
+        "[w64] v_cmp_eq_u32 vcc, s5, v2",
+    ];
+    let (fun, s) = wave_ok(&lines);
+    assert!(s
+        .masks
+        .lanes
+        .values()
+        .any(|u| *u == crate::shader::structure::LaneUse::Waterfall));
+    let p = translate(&fun, &s).unwrap();
+    validate(&p.words);
+    // every lane's compare is true, so the loop body runs once per lane with its own index
+    for (l, o) in wave(&fun, &s, 64, |l| vec![(V2, 1000 + l / 3)])
+        .iter()
+        .enumerate()
+    {
+        assert_eq!(get(o, Reg::S(5)), 1000 + l as u32 / 3);
+        assert_eq!(get(o, VCC), 1);
+    }
+    // the same readfirstlane without the compare is a lane exchange
+    assert_eq!(
+        first_cross_lane(&["[w64] v_readfirstlane_b32 s5, v2"]),
+        "v_readfirstlane_b32"
+    );
+}
+
+#[test]
+fn a_load_from_a_uniform_address_is_uniform_until_a_store() {
+    let m = |lines: &[&str]| {
+        let fun = func(lines);
+        crate::shader::structure::type_masks(&fun).cross_lane.len()
+    };
+    let load = [
+        "[w64] v_mov_b32 v9, s1",
+        "[w64] buffer_load_dword v10, v9, s[8:11], 0 offen",
+        "[w64] v_readfirstlane_b32 s5, v10",
+    ];
+    assert_eq!(m(&load), 0);
+    // a per-lane address
+    assert_eq!(
+        m(&[
+            "[w64] buffer_load_dword v10, v2, s[8:11], 0 offen",
+            "[w64] v_readfirstlane_b32 s5, v10",
+        ]),
+        1
+    );
+    // another lane may have stored to the address first
+    assert_eq!(
+        m(&[
+            "[w64] v_mov_b32 v9, s1",
+            "[w64] buffer_store_dword v0, v9, s[8:11], 0 offen",
+            "[w64] buffer_load_dword v10, v9, s[8:11], 0 offen",
+            "[w64] v_readfirstlane_b32 s5, v10",
+        ]),
+        1
+    );
+}
+
+#[test]
+fn a_cndmask_on_a_per_lane_mask_is_not_uniform() {
+    // vcc compares two per-lane values: the select is per lane
+    let lanes = [
+        "[w64] v_mov_b32 v9, s0",
+        "[w64] v_cmp_lt_u32 vcc, v0, v1",
+        "[w64] v_cndmask_b32 v10, v9, v1, vcc",
+        "[w64] v_readfirstlane_b32 s5, v10",
+    ];
+    assert_eq!(first_cross_lane(&lanes), "v_readfirstlane_b32");
 }
 
 #[test]

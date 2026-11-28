@@ -326,6 +326,7 @@ fn structure_stats(files: &[String]) -> ExitCode {
     let mut errs_free: BTreeMap<(String, String), u32> = BTreeMap::new();
     let mut names: BTreeMap<(String, String), u32> = BTreeMap::new();
     let mut samples: BTreeMap<(String, String), (u64, String)> = BTreeMap::new();
+    let mut first_err: BTreeMap<(String, String), (u64, String)> = BTreeMap::new();
     let (mut no_ir, mut demotes, mut lane_br, mut uni_br, mut wave_br) =
         (0u32, 0u32, 0usize, 0usize, 0usize);
     let (mut proved, mut active) = (0usize, 0usize);
@@ -371,7 +372,12 @@ fn structure_stats(files: &[String]) -> ExitCode {
                     }
                 }
                 Err(err) => {
-                    *errs.entry((name.to_string(), kind(&err))).or_default() += 1;
+                    let key = (name.to_string(), kind(&err));
+                    // the first blob of each kind, for `--structure --ir`-style digging
+                    first_err
+                        .entry(key.clone())
+                        .or_insert((shader::fnv1a64(&bytes), err.to_string()));
+                    *errs.entry(key).or_default() += 1;
                 }
             }
             match structure::structure_with(&func, true) {
@@ -418,6 +424,9 @@ fn structure_stats(files: &[String]) -> ExitCode {
     for ((s, k), (hash, text)) in &samples {
         println!("sample {s}: {k}: {text} (blob hash {hash:016x})");
     }
+    for ((s, k), (hash, text)) in &first_err {
+        println!("first {s}: {k}: {text} (blob hash {hash:016x})");
+    }
     println!("cross-lane instructions (programs that have one):");
     for ((s, k), n) in sorted(names) {
         println!("{n:6}  {s}: {k}");
@@ -427,7 +436,6 @@ fn structure_stats(files: &[String]) -> ExitCode {
 
 /// The category of one cross-lane use (`wave_survey`).
 fn wave_category(
-    f: &shader::ir::Func,
     m: &shader::structure::Masks,
     inst: &shader::ir::Inst,
     eq_cmps: &[Vec<shader::ir::Src>],
@@ -461,7 +469,7 @@ fn wave_category(
         let Some(Src::Val(v)) = src(0) else {
             return "readfirstlane_uniform".into();
         };
-        if shader::structure::wave_uniform(f, m, v, &mut Default::default()) {
+        if m.is_uniform(v) {
             return "readfirstlane_uniform".into();
         }
         let res = inst.dsts.first().map(|d| d.1);
@@ -598,9 +606,7 @@ fn wave_survey(files: &[String]) -> ExitCode {
             for (b, blk) in f.blocks.iter().enumerate() {
                 for (k, inst) in blk.insts.iter().enumerate() {
                     if structure::cross_lane_use(&m, inst).is_some() {
-                        *counts
-                            .entry(wave_category(&f, &m, inst, &eq_cmps))
-                            .or_default() += 1;
+                        *counts.entry(wave_category(&m, inst, &eq_cmps)).or_default() += 1;
                     }
                     if !whole_wave(inst) {
                         continue;

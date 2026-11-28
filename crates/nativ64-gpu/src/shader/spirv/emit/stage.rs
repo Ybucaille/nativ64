@@ -195,6 +195,21 @@ impl<'a> Tr<'a> {
     }
 
     /// The value of an entry register, as a `Src` the program reads.
+    /// The console lane index of this invocation: `LocalInvocationIndex` modulo the wave size
+    /// in compute (0 in the probe). A vertex or pixel invocation cannot tell it: `None`.
+    pub(super) fn lane_index(&mut self, wave32: bool) -> R<Option<u32>> {
+        let tu = self.g.t_u32();
+        match self.stage.as_ref().map(|s| s.io) {
+            None => Ok(Some(self.g.k(0))),
+            Some(StageIo::Compute(_)) => {
+                let i = self.load_builtin(BuiltIn::LocalInvocationIndex, tu);
+                let mask = self.g.k(if wave32 { 31 } else { 63 });
+                Ok(Some(self.g.op(Op::BitwiseAnd, tu, &[i, mask])))
+            }
+            Some(_) => Ok(None),
+        }
+    }
+
     pub(super) fn begin_stage(&mut self) -> R<()> {
         let io = self.io();
         let tu = self.g.t_u32();

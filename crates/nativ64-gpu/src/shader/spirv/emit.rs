@@ -22,7 +22,7 @@ use super::builder::{inst, Module};
 use crate::shader::io::StageIo;
 use crate::shader::ir::{Func, Reg, Src, Term, Val};
 use crate::shader::resource::{SamplerDesc, Translated};
-use crate::shader::structure::{BrKind, BranchKind, Guard, Node, Structured, Target};
+use crate::shader::structure::{BrKind, BranchKind, Guard, LaneUse, Node, Structured, Target};
 
 /// Why a program does not translate.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -460,6 +460,8 @@ struct Tr<'a> {
     /// The `If` arms being emitted whose branch is a per-lane test (a barrier must not be in
     /// one).
     lane_ifs: u32,
+    /// The scalar variable of each spill slot `(vgpr, lane)` (`LaneUse::Slot*`).
+    slots: HashMap<(u16, u8), u32>,
 }
 
 /// Translates a structured program to the probe module.
@@ -552,6 +554,17 @@ fn build<'a>(f: &'a Func, s: &'a Structured, io: Option<&'a StageIo>) -> Result<
         Some(io) => Some(stage::Stage::new(io, resource::analyze(f, io.tables())?)),
         None => None,
     };
+    let mut slots: HashMap<(u16, u8), u32> = HashMap::new();
+    for u in s.masks.lanes.values() {
+        if let LaneUse::SlotWrite { vgpr, lane } | LaneUse::SlotRead { vgpr, lane } = *u {
+            slots.entry((vgpr, lane)).or_insert_with(|| {
+                let v = g.m.global_var(pu, StorageClass::Private, Some(zero));
+                g.m.name(v, &format!("slot_v{vgpr}_{lane}"));
+                iface.push(v);
+                v
+            });
+        }
+    }
     let mut t = Tr {
         f,
         s,
@@ -564,6 +577,7 @@ fn build<'a>(f: &'a Func, s: &'a Structured, io: Option<&'a StageIo>) -> Result<
         frames: Vec::new(),
         stage,
         lane_ifs: 0,
+        slots,
     };
     let entry = t.g.m.id();
     t.g.label(entry);
@@ -715,6 +729,35 @@ impl Tr<'_> {
         let f = self.f;
         let blk = &f.blocks[b];
         for (k, i) in blk.insts.iter().enumerate() {
+            let lane_use = self.s.masks.lanes.get(&i.instr.at).copied();
+            match lane_use {
+                // a spill slot is one scalar variable per lane used; EXEC does not gate it
+                Some(LaneUse::SlotWrite { vgpr, lane }) => {
+                    let Some(&Src::Const(_) | &Src::Val(_)) = i.srcs[0].first() else {
+                        return bad("a spilled scalar that is not a dword");
+                    };
+                    let x = self.read(i.srcs[0][0])?;
+                    let Opd::V(x) = x else {
+                        return bad("a lane mask spilled into a lane");
+                    };
+                    let var = self.slots[&(vgpr, lane)];
+                    self.g.store(var, x);
+                    continue;
+                }
+                Some(LaneUse::SlotRead { vgpr, lane }) => {
+                    let tu = self.g.t_u32();
+                    let var = self.slots[&(vgpr, lane)];
+                    let x = self.g.load(tu, var);
+                    let (reg, val) = i.dsts[0];
+                    self.write(reg, val, Opd::V(x))?;
+                    continue;
+                }
+                _ => {}
+            }
+            let lane = match lane_use {
+                Some(LaneUse::LaneIndex { .. }) => self.lane_index(i.instr.wave32)?,
+                _ => None,
+            };
             let mut srcs = Vec::new();
             for s in &i.srcs {
                 let mut v = Vec::new();
@@ -757,6 +800,7 @@ impl Tr<'_> {
                 imps,
                 dst_mask,
                 active,
+                lane,
             };
             let res = match self.stage_exec(&ctx, b, k)? {
                 Some(r) => r,
