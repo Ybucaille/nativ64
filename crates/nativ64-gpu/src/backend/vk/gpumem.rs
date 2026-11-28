@@ -61,20 +61,6 @@ struct Need {
     run: (usize, usize),
 }
 
-/// The run of `runs` holding `at`, else the one `find` gives (added to `runs`).
-fn run_cached(
-    runs: &mut Vec<(usize, usize)>,
-    at: usize,
-    find: impl FnOnce(usize) -> Option<(usize, usize)>,
-) -> Option<(usize, usize)> {
-    if let Some(&r) = runs.iter().find(|&&(a, b)| a <= at && at < b) {
-        return Some(r);
-    }
-    let r = find(at)?;
-    runs.push(r);
-    Some(r)
-}
-
 /// `va..va+len` (at least 1 byte) as host addresses.
 fn bounds(va: u64, len: u64) -> Option<(usize, usize)> {
     let at = usize::try_from(va).ok()?;
@@ -266,10 +252,6 @@ impl<'g> GpuMemory<'g> {
     /// windows they read are pinned, as before. What fails to import here is tried again, a
     /// window at a time, by `translate`.
     pub fn prepare(&mut self, accesses: &[(u64, u64)]) {
-        // The runs found so far: finding one scans the page states of its whole allocation
-        // (a pool is hundreds of thousands of pages), so a view table of many accesses into
-        // one pool must not do it once per access.
-        let mut runs = Vec::new();
         let needs: Vec<Need> = accesses
             .iter()
             .filter_map(|&(va, len)| {
@@ -277,8 +259,7 @@ impl<'g> GpuMemory<'g> {
                 if self.hit_quiet(at, end) {
                     return None;
                 }
-                let run = run_cached(&mut runs, at, |at| self.run_around(at))?;
-                self.plan_in(at, end, run)
+                self.plan(at, end)
             })
             .collect();
         for (start, end) in coalesce(needs, MERGE_CAP) {
@@ -307,11 +288,7 @@ impl<'g> GpuMemory<'g> {
     /// The window a miss on `at..end` imports; None (logged) when the access does not fit an
     /// import of its run.
     fn plan(&self, at: usize, end: usize) -> Option<Need> {
-        self.plan_in(at, end, self.run_around(at)?)
-    }
-
-    /// [`Self::plan`] in the run `(start, run_end)` around `at`.
-    fn plan_in(&self, at: usize, end: usize, (start, run_end): (usize, usize)) -> Option<Need> {
+        let (start, run_end) = self.run_around(at)?;
         let align = self.gpu.import_alignment().max(1);
         let (start, run_end) = (start.next_multiple_of(align), run_end / align * align);
         if !(start <= at && end <= run_end) {
@@ -558,30 +535,6 @@ mod tests {
             ]
         );
         assert!(coalesce(Vec::new(), w).is_empty());
-    }
-
-    #[test]
-    fn a_run_is_looked_up_once() {
-        let mut runs = Vec::new();
-        let finds = std::cell::Cell::new(0);
-        let find = |at: usize| {
-            finds.set(finds.get() + 1);
-            let run = if at < 0x9000 {
-                (0x1000, 0x9000)
-            } else {
-                (0x9000, 0xa000)
-            };
-            (at >= 0x1000).then_some(run)
-        };
-        assert_eq!(run_cached(&mut runs, 0x2000, find), Some((0x1000, 0x9000)));
-        assert_eq!(run_cached(&mut runs, 0x8fff, find), Some((0x1000, 0x9000)));
-        assert_eq!(run_cached(&mut runs, 0x1000, find), Some((0x1000, 0x9000)));
-        assert_eq!(finds.get(), 1);
-        // outside the runs found: looked up, and a miss is not kept
-        assert_eq!(run_cached(&mut runs, 0x9000, find), Some((0x9000, 0xa000)));
-        assert_eq!(run_cached(&mut runs, 0x10, find), None);
-        assert_eq!(finds.get(), 3);
-        assert_eq!(runs.len(), 2);
     }
 
     #[test]

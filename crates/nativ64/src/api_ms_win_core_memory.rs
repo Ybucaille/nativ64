@@ -74,8 +74,93 @@ const DEFAULT_PLACEMENT: Placement = Placement {
 struct Region {
     size: usize,
     alloc_protect: u32,
-    /// Per page: 0 reserved, else the committed Windows protection.
+    /// Per page: 0 reserved, else the committed Windows protection. Changed only through
+    /// [`Region::set`], which keeps `runs` in step.
     pages: Vec<u16>,
+    /// The maximal runs of usable pages ([`usable`]): first page -> page past the last. Finds
+    /// the run around a page in O(log runs) instead of scanning the page states of the whole
+    /// allocation (a pool is hundreds of thousands of pages, looked up per GPU access).
+    runs: BTreeMap<usize, usize>,
+}
+
+/// Whether a page state is committed and accessible.
+fn usable(p: u16) -> bool {
+    p != 0 && p & 0xff != PAGE_NOACCESS as u16
+}
+
+impl Region {
+    /// An allocation of `size` bytes whose pages all hold `state`.
+    fn new(size: usize, alloc_protect: u32, state: u16) -> Region {
+        let mut r = Region {
+            size,
+            alloc_protect,
+            pages: vec![0; size / PAGE],
+            runs: BTreeMap::new(),
+        };
+        r.set(0, size / PAGE, state);
+        r
+    }
+
+    /// An allocation made of these page states (a split of another one).
+    fn from_pages(alloc_protect: u32, pages: Vec<u16>) -> Region {
+        let mut runs = BTreeMap::new();
+        let mut i = 0;
+        while i < pages.len() {
+            if usable(pages[i]) {
+                let n = pages[i..].iter().take_while(|&&p| usable(p)).count();
+                runs.insert(i, i + n);
+                i += n;
+            } else {
+                i += 1;
+            }
+        }
+        Region {
+            size: pages.len() * PAGE,
+            alloc_protect,
+            pages,
+            runs,
+        }
+    }
+
+    /// Sets pages `first..last` to `state` and updates the runs they touch.
+    fn set(&mut self, first: usize, last: usize, state: u16) {
+        if first >= last {
+            return;
+        }
+        self.pages[first..last].fill(state);
+        // The runs overlapping or adjacent to first..last (disjoint and sorted, so their ends
+        // fall as their starts do).
+        let touched: Vec<(usize, usize)> = self
+            .runs
+            .range(..=last)
+            .rev()
+            .take_while(|&(_, &e)| e >= first)
+            .map(|(&s, &e)| (s, e))
+            .collect();
+        let (mut lo, mut hi) = (first, last);
+        for &(s, e) in &touched {
+            self.runs.remove(&s);
+            if usable(state) {
+                (lo, hi) = (lo.min(s), hi.max(e));
+            } else {
+                if s < first {
+                    self.runs.insert(s, first);
+                }
+                if e > last {
+                    self.runs.insert(last, e);
+                }
+            }
+        }
+        if usable(state) {
+            self.runs.insert(lo, hi);
+        }
+    }
+
+    /// The run of usable pages holding page `i`.
+    fn run_of(&self, i: usize) -> Option<(usize, usize)> {
+        let (&s, &e) = self.runs.range(..=i).next_back()?;
+        (i < e).then_some((s, e))
+    }
 }
 
 struct Table {
@@ -252,7 +337,7 @@ pub fn alloc(
         if unsafe { libc::mprotect(start as *mut c_void, end - start, host_prot(protect)) } != 0 {
             return Err(ERROR_NOT_ENOUGH_MEMORY);
         }
-        region.pages[(start - r) / PAGE..(end - r) / PAGE].fill(protect as u16);
+        region.set((start - r) / PAGE, (end - r) / PAGE, protect as u16);
         return Ok(start);
     }
     let (at, len) = if base != 0 {
@@ -274,20 +359,16 @@ pub fn alloc(
             return Err(ERROR_INVALID_ADDRESS);
         }
     }
-    let mut region = Region {
-        size: len,
-        alloc_protect: protect,
-        pages: vec![0; len / PAGE],
-    };
+    let mut state = 0;
     if kind & MEM_COMMIT != 0 {
         // SAFETY: the mapping was just made.
         if unsafe { libc::mprotect(at as *mut c_void, len, host_prot(protect)) } != 0 {
             unsafe { libc::munmap(at as *mut c_void, len) };
             return Err(ERROR_NOT_ENOUGH_MEMORY);
         }
-        region.pages.fill(protect as u16);
+        state = protect as u16;
     }
-    t.regions.insert(at, region);
+    t.regions.insert(at, Region::new(len, protect, state));
     Ok(at)
 }
 
@@ -319,7 +400,7 @@ pub fn mark_mapped(addr: usize, len: usize, protect: u32) -> Result<(), u32> {
     if !addr.is_multiple_of(PAGE) || !len.is_multiple_of(PAGE) || end > b + region.size {
         return Err(ERROR_INVALID_ADDRESS);
     }
-    region.pages[(addr - b) / PAGE..(end - b) / PAGE].fill(protect as u16);
+    region.set((addr - b) / PAGE, (end - b) / PAGE, protect as u16);
     drop(t);
     note_change(addr, len);
     Ok(())
@@ -365,7 +446,7 @@ pub fn free(addr: usize, size: usize, kind: u32) -> Result<(), u32> {
             if !mmap_fixed_reserve(start, end - start, libc::MAP_FIXED) {
                 return Err(ERROR_NOT_ENOUGH_MEMORY);
             }
-            region.pages[(start - b) / PAGE..(end - b) / PAGE].fill(0);
+            region.set((start - b) / PAGE, (end - b) / PAGE, 0);
             drop(t);
             note_change(start, end - start);
             Ok(())
@@ -390,32 +471,21 @@ fn placeholder(addr: usize, size: usize) -> Result<(), u32> {
     if !mmap_fixed_reserve(addr, size, libc::MAP_FIXED) {
         return Err(ERROR_NOT_ENOUGH_MEMORY);
     }
-    let mut head = t.regions.remove(&b).unwrap();
-    let alloc_protect = head.alloc_protect;
-    let mut tail = head.pages.split_off((end - b) / PAGE);
-    head.pages.truncate((end - b) / PAGE);
-    head.pages.truncate((addr - b) / PAGE);
-    if !head.pages.is_empty() {
-        head.size = head.pages.len() * PAGE;
-        t.regions.insert(b, head);
+    let Region {
+        mut pages,
+        alloc_protect,
+        ..
+    } = t.regions.remove(&b).unwrap();
+    let tail = pages.split_off((end - b) / PAGE);
+    pages.truncate((addr - b) / PAGE);
+    if !pages.is_empty() {
+        t.regions
+            .insert(b, Region::from_pages(alloc_protect, pages));
     }
-    t.regions.insert(
-        addr,
-        Region {
-            size,
-            alloc_protect,
-            pages: vec![0; size / PAGE],
-        },
-    );
+    t.regions.insert(addr, Region::new(size, alloc_protect, 0));
     if !tail.is_empty() {
-        t.regions.insert(
-            end,
-            Region {
-                size: tail.len() * PAGE,
-                alloc_protect,
-                pages: std::mem::take(&mut tail),
-            },
-        );
+        t.regions
+            .insert(end, Region::from_pages(alloc_protect, tail));
     }
     drop(t);
     note_change(addr, size);
@@ -428,26 +498,12 @@ fn placeholder(addr: usize, size: usize) -> Result<(), u32> {
 pub fn committed_run(addr: usize) -> Option<(usize, usize)> {
     let t = table();
     let b = find(&t, addr & !(PAGE - 1))?;
-    let r = &t.regions[&b];
-    let usable = |p: u16| p != 0 && p & 0xff != PAGE_NOACCESS as u16;
-    let i = (addr - b) / PAGE;
-    if !usable(r.pages[i]) {
-        return None;
-    }
-    let first = r.pages[..i]
-        .iter()
-        .rposition(|&p| !usable(p))
-        .map_or(0, |k| k + 1);
-    let last = r.pages[i..]
-        .iter()
-        .position(|&p| !usable(p))
-        .map_or(r.pages.len(), |k| i + k);
+    let (first, last) = t.regions[&b].run_of((addr - b) / PAGE)?;
     Some((b + first * PAGE, b + last * PAGE))
 }
 
 /// Whether every page of `addr..addr + size` is committed and accessible, in one allocation of
-/// the table: the cost follows the size of the range, not of the allocation (unlike
-/// [`committed_run`]).
+/// the table.
 pub fn is_committed(addr: usize, size: usize) -> bool {
     let Some(end) = addr.checked_add(size) else {
         return false;
@@ -458,10 +514,7 @@ pub fn is_committed(addr: usize, size: usize) -> bool {
     };
     let r = &t.regions[&b];
     let (first, last) = ((addr - b) / PAGE, (end - b).div_ceil(PAGE));
-    last <= r.pages.len()
-        && r.pages[first..last]
-            .iter()
-            .all(|&p| p != 0 && p & 0xff != PAGE_NOACCESS as u16)
+    last <= r.pages.len() && (first == last || r.run_of(first).is_some_and(|(_, e)| last <= e))
 }
 
 /// Whether `addr..addr + size` lies in an allocation of the table but has a page that is
@@ -480,10 +533,7 @@ pub fn has_uncommitted_page(addr: usize, size: usize) -> bool {
         (addr - b) / PAGE,
         (end - b).div_ceil(PAGE).min(r.pages.len()),
     );
-    first < last
-        && r.pages[first..last]
-            .iter()
-            .any(|&p| p == 0 || p & 0xff == PAGE_NOACCESS as u16)
+    first < last && !r.run_of(first).is_some_and(|(_, e)| last <= e)
 }
 
 /// One host mapping from `/proc/self/maps`: start, end, readable, writable, executable.
@@ -526,16 +576,16 @@ pub fn protect(addr: usize, size: usize, new: u32) -> Result<u32, u32> {
         if end > b + region.size {
             return Err(ERROR_INVALID_ADDRESS);
         }
-        let pages = &mut region.pages[(start - b) / PAGE..(end - b) / PAGE];
-        if pages.contains(&0) {
+        let (first, last) = ((start - b) / PAGE, (end - b) / PAGE);
+        if region.pages[first..last].contains(&0) {
             return Err(ERROR_INVALID_ADDRESS);
         }
         // SAFETY: the range lies in a mapping the table owns.
         if unsafe { libc::mprotect(start as *mut c_void, end - start, host_prot(new)) } != 0 {
             return Err(ERROR_INVALID_ADDRESS);
         }
-        let old = pages[0] as u32;
-        pages.fill(new as u16);
+        let old = region.pages[first] as u32;
+        region.set(first, last, new as u16);
         return Ok(old);
     }
     let (_, e, r, w, x) = host_mapping(start).ok_or(ERROR_INVALID_ADDRESS)?;
@@ -873,6 +923,81 @@ mod tests {
         assert!(ch.contains(&(a + 0x2000, 0x1000)), "{ch:x?}");
         release(a).unwrap();
         assert!(take_gpu_changes().contains(&(a, 0x10000)));
+    }
+
+    /// The runs as a scan of the page states finds them.
+    fn scanned_runs(pages: &[u16]) -> BTreeMap<usize, usize> {
+        Region::from_pages(RW, pages.to_vec()).runs
+    }
+
+    #[test]
+    fn runs_follow_every_change_of_page_states() {
+        const N: usize = 9;
+        let (rw, none) = (RW as u16, PAGE_NOACCESS as u16);
+        let mut r = Region::new(N * PAGE, RW, 0);
+        assert!(r.runs.is_empty());
+        // every sub-range set to every kind of state, over the result of the previous ones
+        for round in 0..4 {
+            for first in 0..=N {
+                for last in first..=N {
+                    let state = [rw, 0, RO as u16, none][(first * 3 + last + round) % 4];
+                    r.set(first, last, state);
+                    assert_eq!(r.runs, scanned_runs(&r.pages), "{:?}", r.pages);
+                    for i in 0..N {
+                        let usable_run = r.run_of(i);
+                        assert_eq!(usable_run.is_some(), usable(r.pages[i]));
+                        if let Some((a, b)) = usable_run {
+                            assert!(a <= i && i < b);
+                            assert!(r.pages[a..b].iter().all(|&p| usable(p)));
+                            assert!(a == 0 || !usable(r.pages[a - 1]));
+                            assert!(b == N || !usable(r.pages[b]));
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            scanned_runs(&[rw, rw, 0, none, RO as u16, 0, rw]),
+            BTreeMap::from([(0, 2), (4, 5), (6, 7)])
+        );
+    }
+
+    #[test]
+    fn run_lookups_at_edges_after_splits_and_frees() {
+        let a = alloc(0, 0x20000, MEM_RESERVE | MEM_COMMIT, RW, None).unwrap();
+        let whole = Some((a, a + 0x20000));
+        assert_eq!(committed_run(a), whole);
+        assert_eq!(committed_run(a + 0x1ffff), whole);
+        assert!(is_committed(a, 0x20000));
+        assert!(!is_committed(a, 0x20001));
+        // decommit in the middle: two runs, then one again
+        free(a + 0x8000, 0x1000, MEM_DECOMMIT).unwrap();
+        assert_eq!(committed_run(a + 0x7fff), Some((a, a + 0x8000)));
+        assert_eq!(committed_run(a + 0x8000), None);
+        assert_eq!(committed_run(a + 0x9000), Some((a + 0x9000, a + 0x20000)));
+        assert!(!is_committed(a + 0x7000, 0x3000));
+        assert!(has_uncommitted_page(a + 0x7000, 0x3000));
+        alloc(a + 0x8000, 0x1000, MEM_COMMIT, RO, None).unwrap();
+        assert_eq!(committed_run(a + 0x8000), whole);
+        // PAGE_NOACCESS ends a run
+        protect(a + 0x10000, 0x1000, PAGE_NOACCESS).unwrap();
+        assert_eq!(committed_run(a + 0xffff), Some((a, a + 0x10000)));
+        assert_eq!(committed_run(a + 0x10000), None);
+        protect(a + 0x10000, 0x1000, RW).unwrap();
+        assert_eq!(committed_run(a), whole);
+        // a placeholder splits the allocation, and its neighbours keep their runs
+        let hole = MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER;
+        free(a + 0x10000, 0x8000, hole).unwrap();
+        assert_eq!(committed_run(a), Some((a, a + 0x10000)));
+        assert_eq!(committed_run(a + 0x10000), None);
+        let tail = Some((a + 0x18000, a + 0x20000));
+        assert_eq!(committed_run(a + 0x18000), tail);
+        release(a).unwrap();
+        assert_eq!(committed_run(a), None);
+        assert_eq!(committed_run(a + 0x1ffff), tail);
+        release(a + 0x10000).unwrap();
+        release(a + 0x18000).unwrap();
+        assert_eq!(committed_run(a + 0x18000), None);
     }
 
     #[test]
