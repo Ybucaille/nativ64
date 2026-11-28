@@ -3839,7 +3839,7 @@ fn a_spilled_lane_mask_comes_back_as_the_same_mask() {
         "v_cndmask_b32_e64 v1, 0, 1, s3",
     ];
     let (fun, s) = wave_ok(&lines);
-    assert!(s.masks.slot_masks.contains(&(8, 5)));
+    assert_eq!(s.masks.slot_masks.len(), 1);
     module_of(&fun).unwrap();
     let out = lock(&fun, &s, 8, 8, |l| vec![(Reg::V(0), l)]);
     let got: Vec<u32> = out.iter().map(|o| get(o, Reg::V(1))).collect();
@@ -4034,4 +4034,25 @@ fn a_register_the_next_section_overwrites_in_every_lane_is_not_a_result() {
     let out = lock(&fun, &s, 32, 32, |l| vec![(Reg::V(0), l)]);
     let total: u32 = (4..32).sum();
     assert!(out.iter().skip(4).all(|o| get(o, Reg::V(4)) == total));
+}
+
+#[test]
+fn a_spill_lane_reused_for_a_mask_and_a_dword_is_typed_per_read() {
+    // lane 5 holds a dword, then VCC: each read has the kind of the write it sees
+    let lines = [
+        "v_writelane_b32 v8, s0, 5",
+        "v_readlane_b32 s6, v8, 5",
+        "v_cmp_lt_u32_e32 vcc_lo, 3, v0",
+        "v_writelane_b32 v8, vcc_lo, 5",
+        "v_readlane_b32 s3, v8, 5",
+        "v_cndmask_b32_e64 v1, 0, 1, s3",
+        "v_mov_b32_e32 v4, s6",
+    ];
+    let (fun, s) = wave_ok(&lines);
+    assert_eq!(s.masks.slot_masks.len(), 1);
+    module_of(&fun).unwrap();
+    let out = lock(&fun, &s, 8, 8, |l| vec![(Reg::V(0), l), (S0, 77)]);
+    let got: Vec<u32> = out.iter().map(|o| get(o, Reg::V(1))).collect();
+    assert_eq!(got, [0, 0, 0, 0, 1, 1, 1, 1]);
+    assert!(out.iter().all(|o| get(o, Reg::V(4)) == 77));
 }

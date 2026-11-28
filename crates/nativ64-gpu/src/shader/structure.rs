@@ -219,8 +219,8 @@ pub struct Masks {
     pub uniform_vals: Vec<Option<Dom>>,
     /// VGPRs that only spill SGPRs into lanes (`v_writelane` / `v_readlane` at constant lanes).
     pub slots: HashSet<u16>,
-    /// The slots (`(vgpr, lane)`) of those that hold a spilled lane mask.
-    pub slot_masks: HashSet<(u16, u8)>,
+    /// The results of the `v_readlane`s of those that give a spilled lane mask back.
+    pub slot_masks: HashSet<Val>,
     /// The wave instructions items 1-4 of the chunk 7 design give a meaning to, by the byte
     /// offset of the instruction. They are not in `cross_lane`.
     pub lanes: HashMap<usize, LaneUse>,
@@ -272,7 +272,7 @@ pub fn type_masks(f: &Func) -> Masks {
     let mut seeds = HashSet::new();
     for _ in 0..4 {
         let m = type_masks_with(f, &seeds);
-        let more = uniform::mask_slot_reads(f, &m);
+        let more = m.slot_masks.clone();
         if more == seeds {
             return m;
         }

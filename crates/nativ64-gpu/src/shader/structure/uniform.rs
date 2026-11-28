@@ -420,20 +420,73 @@ fn inst_uniform(
     Some(e)
 }
 
+/// What the writes a `v_readlane` of `lane` can see put in the slot, starting from the VGPR
+/// value `from`: (a lane mask, a plain dword).
+fn slot_kinds(f: &Func, m: &Masks, from: Val, lane: u8) -> (bool, bool) {
+    let (mut mask, mut dword) = (false, false);
+    let mut seen = HashSet::new();
+    let mut work = vec![from];
+    while let Some(v) = work.pop() {
+        if !seen.insert(v) {
+            continue;
+        }
+        let mut follow = |s: &Src| {
+            if let Src::Val(x) = s {
+                work.push(*x);
+            }
+        };
+        match f.vals[v.0 as usize].def {
+            ValDef::Arg => {}
+            ValDef::Phi { block, index } => {
+                for (_, s) in &f.blocks[block].phis[index].args {
+                    follow(s);
+                }
+            }
+            ValDef::Inst { block, index } => {
+                let inst = &f.blocks[block].insts[index];
+                let written = inst.srcs.get(1).and_then(|s| s.first());
+                if matches!(written, Some(Src::Const(c)) if lane_index(f, *c) == lane) {
+                    let src = inst.srcs[0].first();
+                    if matches!(src, Some(Src::Val(x)) if m.masks.contains(x)) {
+                        mask = true;
+                    } else {
+                        dword = true;
+                    }
+                } else {
+                    // another lane: this one keeps what the old value held
+                    let reg = f.vals[v.0 as usize].reg;
+                    for (r, s) in &inst.imps {
+                        if *r == reg {
+                            follow(s);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (mask, dword)
+}
+
+/// A constant lane operand, as the hardware reads it.
+fn lane_index(f: &Func, c: u32) -> u8 {
+    (c & if f.wave32 { 31 } else { 63 }) as u8
+}
+
 /// The VGPRs that only spill SGPRs: every definition is `v_writelane` at a constant lane and
-/// every read is `v_readlane` at a constant lane (and nothing else names them). Also the slots
-/// (`(vgpr, lane)`) that hold a lane mask: spilled EXEC and VCC dwords, which come back as masks
-/// (a write of a mask and of a plain dword to one slot is refused).
-pub(super) fn slot_vgprs(f: &Func, m: &Masks) -> (HashSet<u16>, HashSet<(u16, u8)>) {
+/// every read is `v_readlane` at a constant lane (and nothing else names them). Also the
+/// results of the `v_readlane`s that give a lane mask back (spilled EXEC and VCC dwords): a
+/// read that may see a mask or a plain dword depending on the path refuses the VGPR.
+pub(super) fn slot_vgprs(f: &Func, m: &Masks) -> (HashSet<u16>, HashSet<Val>) {
     let (mut good, mut bad) = (HashSet::new(), HashSet::new());
-    let mut kinds: HashMap<(u16, u8), bool> = HashMap::new();
+    // (vgpr, lane, the value read, the result) of each `v_readlane` of a candidate
+    let mut reads: Vec<(u16, u8, Val, Val)> = Vec::new();
     let vgpr = |r: Reg| match r {
         Reg::V(k) => Some(k),
         _ => None,
     };
     let reg_of = |x: &Val| f.vals[x.0 as usize].reg;
     let lane_of = |inst: &Inst, k: usize| match inst.srcs.get(k).and_then(|s| s.first()) {
-        Some(Src::Const(c)) => Some((c & if f.wave32 { 31 } else { 63 }) as u8),
+        Some(Src::Const(c)) => Some(lane_index(f, *c)),
         _ => None,
     };
     for &(r, _) in &f.args {
@@ -446,15 +499,10 @@ pub(super) fn slot_vgprs(f: &Func, m: &Masks) -> (HashSet<u16>, HashSet<(u16, u8
                 // the scalar spilled is a plain dword or a lane mask, not a VGPR
                 let src = inst.srcs[0].first();
                 let is_vgpr = matches!(src, Some(Src::Val(x)) if vgpr(reg_of(x)).is_some());
-                let is_mask = matches!(src, Some(Src::Val(x)) if m.masks.contains(x));
                 let k = vgpr(inst.dsts[0].0);
                 match (k, is_vgpr) {
                     (Some(k), false) => {
                         good.insert(k);
-                        let lane = lane_of(inst, 1).unwrap_or(0);
-                        if *kinds.entry((k, lane)).or_insert(is_mask) != is_mask {
-                            bad.insert(k);
-                        }
                     }
                     _ => bad.extend(k),
                 }
@@ -466,9 +514,12 @@ pub(super) fn slot_vgprs(f: &Func, m: &Masks) -> (HashSet<u16>, HashSet<(u16, u8
                 }
                 continue;
             }
-            if n == "v_readlane_b32" && lane_of(inst, 1).is_some() {
+            if let ("v_readlane_b32", Some(lane)) = (n, lane_of(inst, 1)) {
                 if let Some(Src::Val(x)) = inst.srcs[0].first() {
-                    good.extend(vgpr(reg_of(x)));
+                    if let Some(k) = vgpr(reg_of(x)) {
+                        good.insert(k);
+                        reads.extend(inst.dsts.first().map(|d| (k, lane, *x, d.1)));
+                    }
                 }
                 bad.extend(inst.imps.iter().filter_map(|(r, _)| vgpr(*r)));
                 bad.extend(inst.dsts.iter().filter_map(|d| vgpr(d.0)));
@@ -483,28 +534,23 @@ pub(super) fn slot_vgprs(f: &Func, m: &Masks) -> (HashSet<u16>, HashSet<(u16, u8
             }
         }
     }
-    let slots: HashSet<u16> = good.difference(&bad).copied().collect();
-    let masks = kinds
-        .into_iter()
-        .filter(|((k, _), mask)| *mask && slots.contains(k))
-        .map(|(key, _)| key)
-        .collect();
-    (slots, masks)
-}
-
-/// The destinations of the `v_readlane` instructions that read a mask slot: lane masks too.
-pub(super) fn mask_slot_reads(f: &Func, m: &Masks) -> HashSet<Val> {
-    let mut out = HashSet::new();
-    for blk in &f.blocks {
-        for inst in &blk.insts {
-            if let Some(LaneUse::SlotRead { vgpr, lane }) = m.lanes.get(&inst.instr.at) {
-                if m.slot_masks.contains(&(*vgpr, *lane)) {
-                    out.extend(inst.dsts.first().map(|d| d.1));
-                }
+    let mut masks = Vec::new();
+    for (k, lane, from, result) in reads {
+        match slot_kinds(f, m, from, lane) {
+            (true, true) => {
+                bad.insert(k);
             }
+            (true, false) => masks.push((k, result)),
+            _ => {}
         }
     }
-    out
+    let slots: HashSet<u16> = good.difference(&bad).copied().collect();
+    let masks = masks
+        .into_iter()
+        .filter(|(k, _)| slots.contains(k))
+        .map(|(_, v)| v)
+        .collect();
+    (slots, masks)
 }
 
 /// The meaning of a cross-lane-by-nature instruction under items 1-4, when it has one.
