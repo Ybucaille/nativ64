@@ -60,6 +60,23 @@ fn say_location(rip: u64) {
     }
 }
 
+/// For a fatal fault in host code (our binary, a system library): its file and the offset there,
+/// for addr2line. Not for the sampler: `dladdr` takes the loader's lock, which the sampled thread
+/// may hold.
+fn say_host_location(rip: u64) {
+    // SAFETY: `dladdr` only reads the loader's tables; `di` is plain data it fills.
+    let mut di: libc::Dl_info = unsafe { std::mem::zeroed() };
+    if unsafe { libc::dladdr(rip as *const libc::c_void, &mut di) } != 0
+        && !di.dli_fbase.is_null()
+        && !di.dli_fname.is_null()
+    {
+        // SAFETY: a NUL-terminated path the loader keeps for the process lifetime.
+        let file = unsafe { std::ffi::CStr::from_ptr(di.dli_fname) }.to_string_lossy();
+        let file = file.rsplit('/').next().unwrap_or("?");
+        say(format_args!(" ({file}+{:#x})", rip - di.dli_fbase as u64));
+    }
+}
+
 /// The report of an exception nobody handled (`nativ64::seh`'s fatal hook): same shape as a
 /// fault in host code, then ends the process.
 fn report_unhandled(rec: *const nativ64::seh::ExceptionRecord) {
@@ -207,6 +224,7 @@ extern "C" fn on_fault(sig: i32, info: *mut libc::siginfo_t, uc: *mut libc::c_vo
         "nativ64: fatal {name} ({sig}) at address {addr:#x}, rip {rip:#x}"
     ));
     say_location(rip);
+    say_host_location(rip);
     say(format_args!("\n"));
     unsafe { libc::_exit(139) }
 }
