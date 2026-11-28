@@ -220,12 +220,31 @@ extern "win64" fn is_feature_available(_this: *mut c_void, feature: u32) -> bool
 
 static FEATURE_VTBL: Table<4> = table!(4; is_feature_available);
 
-/// The answer to a request for an API: the system, user and task queue APIs exist.
+/// The telemetry event provider (`XGameEventWrite`), whose id is also its interface id.
+pub const API_EVENT: Guid = Guid::new(
+    0xbbfb_dcc7,
+    0xbfe7,
+    0x409b,
+    [0xa5, 0xca, 0xed, 0xf0, 0x54, 0x96, 0x0b, 0x4d],
+);
+static EVENT_IIDS: [Guid; 1] = [API_EVENT];
+
+/// `XGameEventWrite(user, service config id, session id, name, dimensions, measurements)`:
+/// events go nowhere, and the title is told they were written.
+extern "win64" fn event_write(_this: *mut c_void) -> i32 {
+    S_OK
+}
+
+static EVENT_VTBL: Table<4> = table!(4; event_write);
+
+/// The answer to a request for an API: the system, feature, event, user and task queue APIs exist.
 fn query_api(api: &Guid, iid: &Guid) -> Option<*mut c_void> {
     if *api == API_SYSTEM && *iid == IID_SYSTEM {
         Some(SystemObj::create(&SYSTEM_VTBL, &SYSTEM_IIDS, ()) as *mut c_void)
     } else if *api == API_FEATURE && *iid == API_FEATURE {
         Some(new_object(&FEATURE_VTBL, &FEATURE_IIDS))
+    } else if *api == API_EVENT && *iid == API_EVENT {
+        Some(new_object(&EVENT_VTBL, &EVENT_IIDS))
     } else {
         crate::xuser::query(api, iid).or_else(|| crate::xasync::query(api, iid))
     }
@@ -365,6 +384,16 @@ mod tests {
                 assert_eq!(probe(obj, f), f != 1 && f != 14 && f != 22, "feature {f}");
             }
             assert!(!probe(obj, u32::MAX));
+        }
+    }
+
+    #[test]
+    fn event_writes_succeed_and_go_nowhere() {
+        unsafe {
+            let mut obj = std::ptr::null_mut();
+            assert_eq!(QueryApiImpl(&API_EVENT, &API_EVENT, &mut obj), S_OK);
+            let write: extern "win64" fn(*mut c_void) -> i32 = method(obj, 3);
+            assert_eq!(write(obj), S_OK);
         }
     }
 
