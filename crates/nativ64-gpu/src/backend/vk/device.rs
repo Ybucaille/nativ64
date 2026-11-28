@@ -7,8 +7,10 @@
 //! draw parameters, formatless storage image reads and writes (compute, chunk 10c)
 //! and the descriptor indexing the bindless set needs (update after bind,
 //! partially bound, runtime arrays, non-uniform indexing of sampled and storage images); the
-//! refusal names the first missing feature (chunk 10).
+//! refusal names the first missing feature (chunk 10). What the shaders need of subgroups
+//! (chunk 7c) is listed in `subgroup`.
 
+use super::subgroup::Subgroups;
 use super::{instance, log_once, vk_try, Result, VkError};
 use ash::{ext::external_memory_host, ext::memory_budget, khr, vk, Device, Entry, Instance};
 use std::sync::Mutex;
@@ -30,6 +32,8 @@ pub struct Gpu {
     pub(super) instance: Instance,
     /// Sampler and texture features optional in Vulkan (chunk 10b).
     pub(super) caps: Caps,
+    /// The subgroup properties, which translated modules are fitted to (chunk 7c).
+    pub(super) subgroups: Subgroups,
     /// `VK_EXT_memory_budget` is enabled on the device.
     memory_budget: bool,
     /// Command pool, buffer and fence `submit_once` reuses (created on first use).
@@ -147,6 +151,9 @@ fn check(instance: &Instance, phys: vk::PhysicalDevice) -> std::result::Result<u
         if let Some(name) = Features::query(instance, phys).missing() {
             return Err(format!("feature {name} missing"));
         }
+        if let Some(what) = Subgroups::query(instance, phys).missing() {
+            return Err(format!("{what} missing"));
+        }
         instance
             .get_physical_device_queue_family_properties(phys)
             .iter()
@@ -217,8 +224,10 @@ impl Gpu {
                     .unwrap_or_default()
                     .iter()
                     .any(|e| e.extension_name_as_c_str() == Ok(memory_budget::NAME));
+                let subgroups = Subgroups::query(&instance, phys);
                 Ok(Gpu {
                     caps,
+                    subgroups,
                     memory_budget,
                     device,
                     ext_host,
@@ -362,13 +371,22 @@ impl Gpu {
         {
             exts.push(memory_budget::NAME.as_ptr());
         }
-        let info = vk::DeviceCreateInfo::default()
+        let reconverge = Subgroups::query(instance, phys).max_reconvergence;
+        if reconverge {
+            exts.push(khr::shader_maximal_reconvergence::NAME.as_ptr());
+        }
+        let mut mr = vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR::default()
+            .shader_maximal_reconvergence(true);
+        let mut info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&qi)
             .enabled_extension_names(&exts)
             .push_next(&mut f2)
             .push_next(&mut f11)
             .push_next(&mut f12)
             .push_next(&mut f13);
+        if reconverge {
+            info = info.push_next(&mut mr);
+        }
         // SAFETY: `info` and its pointees outlive the call.
         let device = vk_try("vkCreateDevice", unsafe {
             instance.create_device(phys, &info, None)

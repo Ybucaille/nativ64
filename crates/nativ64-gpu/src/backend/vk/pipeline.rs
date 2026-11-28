@@ -470,7 +470,7 @@ fn build(
     if rect && !gpu.caps.geometry {
         return Err("a rectangle list needs geometryShader, which this device lacks".into());
     }
-    let (tv, tp) = match &ps {
+    let (mut tv, mut tp) = match &ps {
         Some(ps) => {
             let (a, b) =
                 io::translate_pair(&vs, ps, &g.target_formats).map_err(|e| e.to_string())?;
@@ -485,6 +485,12 @@ fn build(
         if t.memory_addresses {
             return Err("a stage that reads memory through an address it loaded".into());
         }
+    }
+    gpu.subgroups
+        .adapt(&mut tv.words, vk::ShaderStageFlags::VERTEX)?;
+    if let Some(t) = &mut tp {
+        gpu.subgroups
+            .adapt(&mut t.words, vk::ShaderStageFlags::FRAGMENT)?;
     }
     // the pair's static samplers: both stages carry the whole list
     let layouts = bindless.layouts(&tv.samplers, samplers)?;
@@ -731,7 +737,7 @@ fn build_compute(
     if let Some(s) = pd.stages.iter().find(|s| s.name != "compute") {
         return Err(format!("a stage {} in a compute pipeline", s.name));
     }
-    let (words, static_samplers, rows) = match injected(pd.serial) {
+    let (mut words, static_samplers, rows) = match injected(pd.serial) {
         Some((words, rows)) => (words, Vec::new(), rows),
         None => {
             let bytes = stage(pd, "compute").ok_or("no compute stage")?;
@@ -744,6 +750,8 @@ fn build_compute(
             (t.words, t.samplers, rows)
         }
     };
+    gpu.subgroups
+        .adapt(&mut words, vk::ShaderStageFlags::COMPUTE)?;
     let layouts = bindless.layouts(&static_samplers, samplers)?;
     validate(&words, "compute");
     let d = &gpu.device;

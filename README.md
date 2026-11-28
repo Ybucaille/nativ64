@@ -119,8 +119,9 @@ Host functions still to write for the first title (221 of 697):
 - To run a title: a GPU and driver with **Vulkan 1.3**, `VK_EXT_external_memory_host` and
   the features the backend checks at start (`shaderInt64`, `depthClamp`, `independentBlend`,
   buffer device address, timeline semaphores, descriptor indexing with non-uniform
-  indexing, dynamic rendering, synchronization2, demote to helper invocation...). The exact
-  list is in `crates/nativ64-gpu/src/backend/vk/device.rs`; a device that lacks one is
+  indexing, dynamic rendering, synchronization2, demote to helper invocation, subgroup
+  operations in compute and fragment shaders...). The exact list is in
+  `crates/nativ64-gpu/src/backend/vk/` (`device.rs` and `subgroup.rs`); a device that lacks one is
   refused with the name of the first missing feature. A Wayland compositor gives a real
   window; without one, rendering is headless.
 - The tests need no game and no GPU: CI runs them on Mesa's CPU driver (lavapipe).

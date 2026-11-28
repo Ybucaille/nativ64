@@ -23,6 +23,7 @@ mod residency;
 mod rootblock;
 mod sampler;
 mod staging;
+pub(crate) mod subgroup;
 mod swapchain;
 mod textures;
 mod watch;
