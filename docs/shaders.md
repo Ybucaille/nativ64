@@ -436,6 +436,71 @@ Sub-chunks, each with its corpus count (`--structure --waves` and `--structure -
   mbcnt or `s_ff1`): cs 2024, ps 1687, mesh 1569, vs 270. ALU coverage 8525/8611 programs
   (3006/3060 structured).
 
+**As built (7b)** (corpus of 19101 blobs; IR 19066 programs; `structure/uniform.rs`, the lane
+facts in `Masks`, the table and emitter in `spirv/`):
+- **Uniformity** (item 1). `Masks::uniform_vals` gives each value a *domain*: `Full` (every lane
+  of the wave) or `Exec(e)` (the lanes of an EXEC value, `e` narrowing through `within`), or none.
+  Optimistic fixpoint, lowered until stable. A VGPR instruction result has the domain of its own
+  EXEC (`Full` under the entry EXEC or a constant all-ones one): its sources must cover that
+  domain, so a write under a narrowed EXEC is uniform for the lanes that wrote, not for the ones
+  that keep the old value. Rules: scalars, entry VGPRs the stage marks uniform
+  (`EntryRegs::uniform_vgprs`, `Func::uniform_args`; mesh `v5`), VOP/VOP3 of uniform operands,
+  `v_cndmask`/`v_addc`... whose mask is a constant or an EXEC-uniform mask (`Masks::uniform`)
+  covering the instruction's lanes, pure loads (MUBUF, MTBUF, `global_load`, `image_load`,
+  `get_resinfo` and samples with `_l`/`_lz`/`_d`, no `_b`/`_cl`) of uniform operands with no
+  store or atomic earlier in the same block. A phi is uniform when its inputs are and its block
+  is not in the region of a lane-wise branch (the blocks between the branch and its join, join
+  included; every block of the region when the branch is in a loop, since its lanes leave at
+  different iterations). **Deviation**: the survey's strict test took any phi of uniform inputs
+  and ignored the old value of a written VGPR; both are unsound under lane-wise flow, which is
+  why ps/vs structure counts dip slightly (below). `v_readfirstlane` and `v_readlane` of a
+  value that covers their lanes are copies (`LaneUse::Copy`; `v_readlane` has no EXEC, so only
+  a `Full` value qualifies). The table (`alu::exec`) runs both as a move.
+- **Spill slots** (item 2). `slot_vgprs`: a VGPR that is not an entry register, whose every
+  definition is `v_writelane` at a constant lane and every read `v_readlane` at a constant
+  lane (lane masked to the wave size), nothing else naming it. Each `(vgpr, lane)` is a `Private`
+  `u32` variable (zero at entry: a slot read before any write reads 0, the probe's `undef`);
+  the emitter handles `LaneUse::SlotWrite/SlotRead` itself, ignoring EXEC (the ISA ignores it
+  for both). The phis of a slot VGPR count as scalar phis for `divergent_scalar`, so a write in
+  a lane-skipped region is speculated (`BranchKind::Wave`) or an error, like an SGPR.
+  **Not supported**: a writelane whose scalar is a lane mask (a spilled EXEC/VCC; 23% of the
+  sampled compute programs): the slot is refused and the instructions stay cross-lane (mask as
+  data, item 7). The per-lane form would need a mask-typed slot lane and a mask-typed readlane
+  result.
+- **Waterfall** (item 3). A `v_readfirstlane` of a non-uniform value whose result and source
+  meet in a `v_cmp_eq`/`v_cmpx_eq` anywhere in the program is `LaneUse::Waterfall`: the table runs
+  it as a move (own lane value); the compare is true and the body runs once per lane.
+  Resources need nothing new: every descriptor array element is already `NonUniform`
+  (`resource.rs`, `non_uniform`).
+- **Lane index** (item 4). `v_mbcnt_lo/hi(-1, x)` is `LaneUse::LaneIndex`; `Ctx::lane` carries
+  the lane: the probe 0, compute `LocalInvocationIndex & 63` (`& 31` in wave32), a vertex or
+  pixel program `None`, which is `Unsupported { chunk: 7 }` naming "the lane index of a vertex or
+  pixel program". `mbcnt_lo = min(lane, 32) + x`, `mbcnt_hi = max(lane, 32) - 32 + x`. `mbcnt`
+  of a real mask stays cross-lane (ballot, 7c). Not done: `scalar bits as lane masks` still read
+  bit 0 of the scalar (7a) instead of bit `lane`.
+- **Wave evaluator** (tests, `spirv/tests.rs`): `wave(f, s, lanes, inputs)` runs the CPU
+  evaluator once per console lane with its lane index; lanes meet nowhere because no subgroup
+  op is emitted yet, so the host width cannot matter and is not a parameter; 7c adds it with the
+  first op that uses it (and a lock-step run for the `Wave` vote, still read as `Lane`). Tests:
+  slots over 64 lanes, lane index lo/hi, waterfall own-value, uniform copies, narrowed-EXEC
+  writes, loads before/after a store; each validated with `spirv-val`.
+- **Corpus** (`--structure --stats`, `--spirv --stats`, release; before = 7a head, after = 7b):
+
+  | | IR | structure before | structure after | SPIR-V valid before | after |
+  |---|---|---|---|---|---|
+  | all | 19066 | 5124 | **10328** (19058 ignoring cross-lane) | 2838 | **2843** |
+  | cs | 2718 | 928 | 1086 | 268 | 275 |
+  | mesh | 6681 | 0 | 5158 | 0 | 0 (all stop at `s_load`, chunk 9) |
+  | ps | 8517 | 3128 | 2985 | 2026 | 2020 |
+  | vs | 1150 | 1068 | 1099 | 544 | 548 |
+
+  ps loses 143 structured programs and 6 valid ones against the unsound strict test (a
+  readfirstlane after a lane-wise region, or of a value written under a narrowed EXEC). Cross-lane
+  uses left, by programs: ps `ds_swizzle_b32` 4615, `v_readfirstlane` 2652 (cs 1447, mesh 1445:
+  non-uniform source, no waterfall), DPP movs 2098, `v_readlane` 1392 (cs 1060: mask spills and
+  whole-wave tails), `v_permlanex16` 1151 (cs 923), `s_ff1` cs 787, `v_writelane` cs 709.
+  `--structure --stats` now prints the first failing blob of each error kind.
+
 ## Inputs and outputs
 
 **User SGPRs.** A VS/PS/CS receives user-data dword i in `s[i]`; merged stages and mesh have 8
