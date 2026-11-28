@@ -14,7 +14,7 @@ use std::collections::HashMap;
 
 use super::uniform::LaneUse;
 use crate::shader::gfx10::{Dpp, DppKind, Enc};
-use crate::shader::ir::{BlockId, Func, Inst, Reg, Src, Term, Val};
+use crate::shader::ir::{BlockId, Func, Inst, Reg, Src, Term, Val, ValDef};
 
 /// The associative operation of a reduction or scan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -254,30 +254,97 @@ fn classify(x: &[Sym], full: u64) -> Option<(WaveOp, Scan, Val)> {
     None
 }
 
-/// Where each value is read: the block and the instruction (`usize::MAX`: a phi or the
-/// terminator).
+/// Where each value is observed: the block and the instruction (`usize::MAX`: a phi or the
+/// terminator) of every read that can matter.
 type Reads = HashMap<Val, Vec<(BlockId, usize)>>;
 
+/// The constant a dword of EXEC holds, when the instruction that defines it says so.
+fn exec_const(f: &Func, s: Src) -> Option<u32> {
+    let v = match s {
+        Src::Const(c) => return Some(c),
+        Src::Val(v) => v,
+        _ => return None,
+    };
+    let ValDef::Inst { block, index } = f.vals[v.0 as usize].def else {
+        return None;
+    };
+    let i = &f.blocks[block].insts[index];
+    let k = i
+        .dsts
+        .iter()
+        .filter(|(r, _)| matches!(r, Reg::ExecLo | Reg::ExecHi))
+        .position(|(_, d)| *d == v)?;
+    let n = i.instr.name();
+    match i.srcs.first()?.get(k)? {
+        Src::Const(c) if n.starts_with("s_mov_b") => Some(*c),
+        Src::Const(u32::MAX) if n.starts_with("s_or_saveexec_b") => Some(u32::MAX),
+        _ => None,
+    }
+}
+
+/// True when the instruction writes every lane of its destination, so the old value it names
+/// is never seen again.
+fn writes_every_lane(f: &Func, i: &Inst) -> bool {
+    let all = |r: Reg| {
+        i.imps
+            .iter()
+            .any(|&(x, s)| x == r && exec_const(f, s) == Some(u32::MAX))
+    };
+    let partial_dpp = i.instr.dpp.is_some_and(|d| {
+        let shifts = d.kind == DppKind::Dpp16 && (0x101..=0x13f).contains(&d.ctrl);
+        (0..64).any(|k| !dpp_enabled(&d, k)) || (shifts && !d.bound_ctrl)
+    });
+    all(Reg::ExecLo) && (f.wave32 || all(Reg::ExecHi)) && !partial_dpp
+}
+
+/// The reads of every value. The old value of a VGPR that an instruction overwrites in every
+/// lane is not one (the temporaries of a section are reused that way), nor is the input of a
+/// phi nothing reads.
 fn reads_of(f: &Func) -> Reads {
     let mut out = Reads::new();
-    for (b, blk) in f.blocks.iter().enumerate() {
-        let mut note = |s: &Src, k: usize| {
-            if let Src::Val(v) = s {
-                out.entry(*v).or_default().push((b, k));
-            }
-        };
-        for p in &blk.phis {
-            p.args.iter().for_each(|(_, s)| note(s, usize::MAX));
+    let mut note = |s: &Src, at: (BlockId, usize)| {
+        if let Src::Val(v) = s {
+            out.entry(*v).or_default().push(at);
         }
+    };
+    for (b, blk) in f.blocks.iter().enumerate() {
         for (k, inst) in blk.insts.iter().enumerate() {
-            inst.srcs.iter().flatten().for_each(|s| note(s, k));
-            inst.imps.iter().for_each(|(_, s)| note(s, k));
+            inst.srcs.iter().flatten().for_each(|s| note(s, (b, k)));
+            let full = writes_every_lane(f, inst);
+            for (r, s) in &inst.imps {
+                if !(full && matches!(r, Reg::V(_)) && inst.dsts.iter().any(|d| d.0 == *r)) {
+                    note(s, (b, k));
+                }
+            }
         }
         if let Term::Branch { cond, .. } = &blk.term {
-            cond.iter().for_each(|(_, s)| note(s, usize::MAX));
+            cond.iter().for_each(|(_, s)| note(s, (b, usize::MAX)));
         }
     }
-    out
+    let mut pending: Vec<(BlockId, usize)> = f
+        .blocks
+        .iter()
+        .enumerate()
+        .flat_map(|(b, blk)| (0..blk.phis.len()).map(move |k| (b, k)))
+        .collect();
+    loop {
+        let before = pending.len();
+        pending.retain(|&(b, k)| {
+            let phi = &f.blocks[b].phis[k];
+            if !out.contains_key(&phi.dst) {
+                return true;
+            }
+            for (_, s) in &phi.args {
+                if let Src::Val(v) = s {
+                    out.entry(*v).or_default().push((b, usize::MAX));
+                }
+            }
+            false
+        });
+        if pending.len() == before {
+            return out;
+        }
+    }
 }
 
 /// Simulates the section of block `b` between instruction `a` (the `s_or_saveexec ..., -1`)

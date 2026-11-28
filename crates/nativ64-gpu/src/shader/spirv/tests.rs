@@ -4021,3 +4021,17 @@ fn a_whole_wave_section_the_simulation_does_not_model_is_refused() {
     lines.insert(13, "v_mul_lo_u32 v2, v1, v2");
     assert_eq!(first_cross_lane(&lines), "v_mov_b32 (dpp)");
 }
+
+#[test]
+fn a_register_the_next_section_overwrites_in_every_lane_is_not_a_result() {
+    // two sums in a row reuse v1 and v2: the old values the second one names are never seen
+    let mut lines = SUM_SECTION.to_vec();
+    lines.push("v_mov_b32_e32 v4, s6");
+    lines.extend_from_slice(&SUM_SECTION[2..]);
+    lines.push("v_mov_b32_e32 v3, v1");
+    let (fun, s) = wave_ok(&lines);
+    module_of(&fun).unwrap();
+    let out = lock(&fun, &s, 32, 32, |l| vec![(Reg::V(0), l)]);
+    let total: u32 = (4..32).sum();
+    assert!(out.iter().skip(4).all(|o| get(o, Reg::V(4)) == total));
+}
