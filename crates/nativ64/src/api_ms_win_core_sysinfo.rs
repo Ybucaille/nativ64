@@ -1,5 +1,9 @@
 use crate::api_ms_win_core_errorhandling::set_last_error;
 use crate::api_ms_win_core_profile::monotonic_ns;
+use crate::topology::{
+    self, RELATION_ALL, RELATION_GROUP, RELATION_NUMA_NODE_EX, RELATION_PROCESSOR_DIE,
+    RELATION_PROCESSOR_MODULE,
+};
 
 /// 100 ns intervals between 1601-01-01 and 1970-01-01.
 const UNIX_EPOCH_AS_FILETIME: u64 = 116_444_736_000_000_000;
@@ -51,65 +55,146 @@ unsafe fn store_systemtime(out: *mut u16, local: bool) {
 
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 const ERROR_INVALID_PARAMETER: u32 = 87;
-/// `SYSTEM_LOGICAL_PROCESSOR_INFORMATION`: mask, relationship, 16 bytes of union.
-const LPI_SIZE: usize = 32;
-const RELATION_PROCESSOR_CORE: u32 = 0;
-const RELATION_PROCESSOR_PACKAGE: u32 = 3;
 
-/// The logical processors this process may run on, as a mask (at most 64: one processor group).
-fn processor_mask() -> u64 {
-    // SAFETY: a zeroed cpu_set_t is valid, and the call fills it.
-    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-    let ok = unsafe { libc::sched_getaffinity(0, size_of::<libc::cpu_set_t>(), &mut set) } == 0;
-    let mut mask = 0u64;
-    if ok {
-        for i in 0..64 {
-            // SAFETY: `i` is below CPU_SETSIZE.
-            if unsafe { libc::CPU_ISSET(i, &set) } {
-                mask |= 1 << i;
-            }
-        }
-    }
-    if mask == 0 {
-        1
-    } else {
-        mask
-    }
-}
-
-/// One core entry per logical processor (no SMT siblings reported), then one package entry.
-unsafe fn logical_processor_information(buffer: *mut u8, length: *mut u32) -> i32 {
+/// The two-call size protocol of the `GetLogicalProcessorInformation*` functions: `emit` is
+/// run once to size the records, and once more to copy them when `*length` is big enough.
+/// Otherwise `*length` receives the size needed and the call fails with
+/// `ERROR_INSUFFICIENT_BUFFER`.
+unsafe fn copy_records(
+    buffer: *mut u8,
+    length: *mut u32,
+    emit: impl Fn(&mut dyn FnMut(&[u8])),
+) -> i32 {
     if length.is_null() {
-        set_last_error(87);
+        set_last_error(ERROR_INVALID_PARAMETER);
         return 0;
     }
-    let mask = processor_mask();
-    let entries = mask.count_ones() as usize + 1;
-    let need = entries * LPI_SIZE;
+    let mut need = 0usize;
+    emit(&mut |r| need += r.len());
     if (length.read_unaligned() as usize) < need || buffer.is_null() {
         length.write_unaligned(need as u32);
         set_last_error(ERROR_INSUFFICIENT_BUFFER);
         return 0;
     }
-    let mut out = buffer;
-    let mut put = |mask: u64, relation: u32| {
-        std::ptr::write_bytes(out, 0, LPI_SIZE);
-        (out as *mut u64).write_unaligned(mask);
-        (out.add(8) as *mut u32).write_unaligned(relation);
-        out = out.add(LPI_SIZE);
-    };
-    for bit in (0..64).filter(|b| mask >> b & 1 != 0) {
-        put(1 << bit, RELATION_PROCESSOR_CORE);
-    }
-    put(mask, RELATION_PROCESSOR_PACKAGE);
+    let mut at = 0usize;
+    emit(&mut |r| {
+        // SAFETY: the caller's buffer holds `*length` >= `need` bytes and `at + r.len()` <= `need`.
+        unsafe { std::ptr::copy_nonoverlapping(r.as_ptr(), buffer.add(at), r.len()) };
+        at += r.len();
+    });
     length.write_unaligned(need as u32);
     1
+}
+
+/// `SYSTEM_INFO` (48 bytes): the processors this process may use, 4 KiB pages, 64 KiB
+/// allocation granularity, the user half of the address space. The process is never WOW64,
+/// so `GetSystemInfo` answers the same.
+///
+/// The processor count and mask follow this process's affinity, as Windows' do for the
+/// processors of the caller's group (the group is the 64 processors, at most, it may run on).
+/// A title sizes its worker pools from them, so counting CPUs it cannot be scheduled on (cgroup
+/// or `taskset` limits) would oversubscribe it; the topology records use the same mask.
+unsafe fn system_info(out: *mut u8) {
+    if out.is_null() {
+        return;
+    }
+    let mask = topology::processor_mask();
+    let (level, revision) = processor_level_and_revision();
+    std::ptr::write_bytes(out, 0, 48);
+    out.cast::<u16>().write_unaligned(9); // PROCESSOR_ARCHITECTURE_AMD64
+    out.add(4).cast::<u32>().write_unaligned(4096);
+    out.add(8).cast::<u64>().write_unaligned(0x1_0000);
+    out.add(16).cast::<u64>().write_unaligned(0x7FFF_FFFE_FFFF);
+    out.add(24).cast::<u64>().write_unaligned(mask);
+    out.add(32).cast::<u32>().write_unaligned(mask.count_ones());
+    out.add(36).cast::<u32>().write_unaligned(8664); // PROCESSOR_AMD_X8664
+    out.add(40).cast::<u32>().write_unaligned(0x1_0000);
+    out.add(44).cast::<u16>().write_unaligned(level);
+    out.add(46).cast::<u16>().write_unaligned(revision);
+}
+
+/// `wProcessorLevel` (the family) and `wProcessorRevision` (model << 8 | stepping), from CPUID
+/// leaf 1 with the extended family and model folded in.
+fn processor_level_and_revision() -> (u16, u16) {
+    let eax = std::arch::x86_64::__cpuid(1).eax;
+    let family = (eax >> 8 & 0xf) as u16;
+    let mut model = (eax >> 4 & 0xf) as u16;
+    if family == 0x6 || family == 0xf {
+        model |= ((eax >> 16 & 0xf) as u16) << 4;
+    }
+    let level = if family == 0xf {
+        family + (eax >> 20 & 0xff) as u16
+    } else {
+        family
+    };
+    (level, model << 8 | (eax & 0xf) as u16)
+}
+
+/// `MemAvailable` from `/proc/meminfo`, in bytes: free memory plus what the kernel can reclaim
+/// (page cache). `sysinfo.freeram` leaves the cache out and reads far too low.
+fn mem_available() -> Option<u64> {
+    let mut buf = [0u8; 512];
+    // SAFETY: the path is a NUL-terminated literal; the descriptor is closed below.
+    let fd = unsafe { libc::open(c"/proc/meminfo".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: `buf` is valid for `buf.len()` bytes. MemAvailable is the third line, well
+    // within the first 512 bytes.
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+    // SAFETY: `fd` is open and owned here.
+    unsafe { libc::close(fd) };
+    let text = std::str::from_utf8(buf.get(..usize::try_from(n).ok()?)?).ok()?;
+    let line = text.lines().find(|l| l.starts_with("MemAvailable:"))?;
+    let kb = line["MemAvailable:".len()..]
+        .trim()
+        .strip_suffix("kB")?
+        .trim();
+    kb.parse::<u64>().ok().map(|k| k * 1024)
 }
 
 win32! {
     module "api-ms-win-core-sysinfo" => "kernel32";
     Native fn GetLogicalProcessorInformation(buffer: *mut u8, length: *mut u32) -> i32 {
-        logical_processor_information(buffer, length)
+        copy_records(buffer, length, |f| topology::topology().for_each_legacy(|e| f(e)))
+    }
+    // Cores (with SMT), caches, packages, one NUMA node and one group, from the host topology.
+    Native fn GetLogicalProcessorInformationEx(
+        relationship: u32,
+        buffer: *mut u8,
+        length: *mut u32
+    ) -> i32 {
+        if relationship > RELATION_GROUP
+            && relationship != RELATION_PROCESSOR_DIE
+            && relationship != RELATION_NUMA_NODE_EX
+            && relationship != RELATION_PROCESSOR_MODULE
+            && relationship != RELATION_ALL
+        {
+            set_last_error(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        copy_records(buffer, length, |f| topology::topology().for_each_ex(relationship, |r| f(r)))
+    }
+    Native fn GetNativeSystemInfo(out: *mut u8) {
+        system_info(out);
+    }
+    Native fn GetSystemInfo(out: *mut u8) {
+        system_info(out);
+    }
+    // Windows' default clock tick (15.625 ms) with periodic adjustment disabled.
+    Native fn GetSystemTimeAdjustment(
+        adjustment: *mut u32,
+        increment: *mut u32,
+        disabled: *mut i32
+    ) -> i32 {
+        if adjustment.is_null() || increment.is_null() || disabled.is_null() {
+            set_last_error(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        adjustment.write_unaligned(156_250);
+        increment.write_unaligned(156_250);
+        disabled.write_unaligned(1);
+        1
     }
     Native fn GetSystemTimeAsFileTime(out: *mut u32) {
         store_filetime(out, filetime_now());
@@ -124,7 +209,8 @@ win32! {
     Native fn GetLocalTime(out: *mut u16) {
         store_systemtime(out, true);
     }
-    // MEMORYSTATUSEX (64 bytes): the host's RAM and swap; virtual space is the user half (128 TiB).
+    // MEMORYSTATUSEX (64 bytes): the host's RAM (available = MemAvailable) and swap; virtual
+    // space is the user half (128 TiB).
     Native fn GlobalMemoryStatusEx(out: *mut u8) -> i32 {
         if out.is_null() || (out as *const u32).read_unaligned() != 64 {
             set_last_error(ERROR_INVALID_PARAMETER);
@@ -133,7 +219,8 @@ win32! {
         let mut si: libc::sysinfo = std::mem::zeroed();
         libc::sysinfo(&mut si);
         let unit = si.mem_unit.max(1) as u64;
-        let (total, avail) = (si.totalram as u64 * unit, si.freeram as u64 * unit);
+        let total = si.totalram as u64 * unit;
+        let avail = mem_available().unwrap_or(si.freeram as u64 * unit).min(total);
         let (swap, swap_free) = (si.totalswap as u64 * unit, si.freeswap as u64 * unit);
         let virt = 0x7FFF_FFFE_FFFFu64;
         let load = (100 - (avail * 100).checked_div(total).unwrap_or(100)) as u32;
@@ -238,6 +325,8 @@ mod tests {
         }
     }
 
+    use crate::api_ms_win_core_errorhandling::GetLastError;
+
     #[test]
     fn logical_processors() {
         unsafe {
@@ -246,21 +335,139 @@ mod tests {
                 GetLogicalProcessorInformation(std::ptr::null_mut(), &mut len),
                 0
             );
-            assert_eq!(crate::api_ms_win_core_errorhandling::GetLastError(), 122);
+            assert_eq!(GetLastError(), 122);
             assert!(len >= 64 && len.is_multiple_of(32));
             let mut buf = vec![0u8; len as usize];
+            let mut short = len - 32;
+            assert_eq!(
+                GetLogicalProcessorInformation(buf.as_mut_ptr(), &mut short),
+                0
+            );
+            assert_eq!((GetLastError(), short), (122, len));
             assert_eq!(
                 GetLogicalProcessorInformation(buf.as_mut_ptr(), &mut len),
                 1
             );
+            let mut cores = 0u64;
+            for e in buf.chunks(32) {
+                let mask = u64::from_le_bytes(e[..8].try_into().unwrap());
+                if e[8] == 0 {
+                    assert_eq!(cores & mask, 0, "a processor in two cores");
+                    cores |= mask;
+                }
+            }
+            assert_eq!(cores, topology::processor_mask());
             let last = &buf[len as usize - 32..];
-            assert_eq!(u32::from_le_bytes(last[8..12].try_into().unwrap()), 3);
-            let all = u64::from_le_bytes(last[..8].try_into().unwrap());
-            assert_eq!(all.count_ones() as usize, len as usize / 32 - 1);
+            assert_eq!(u32::from_le_bytes(last[8..12].try_into().unwrap()), 1);
             assert_eq!(
                 GetLogicalProcessorInformation(buf.as_mut_ptr(), std::ptr::null_mut()),
                 0
             );
+            assert_eq!(GetLastError(), 87);
         }
+    }
+
+    #[test]
+    fn logical_processors_ex() {
+        unsafe {
+            let mut len = 0u32;
+            assert_eq!(
+                GetLogicalProcessorInformationEx(RELATION_ALL, std::ptr::null_mut(), &mut len),
+                0
+            );
+            assert_eq!(GetLastError(), 122);
+            let mut buf = vec![0u8; len as usize];
+            assert_eq!(
+                GetLogicalProcessorInformationEx(RELATION_ALL, buf.as_mut_ptr(), &mut len),
+                1
+            );
+            let (mut at, mut kinds) = (0usize, 0u32);
+            while at < len as usize {
+                let kind = u32::from_le_bytes(buf[at..at + 4].try_into().unwrap());
+                let size = u32::from_le_bytes(buf[at + 4..at + 8].try_into().unwrap());
+                assert!(size >= 48 && kind <= 7 && kind != 6, "{kind} {size}");
+                kinds |= 1 << kind;
+                at += size as usize;
+            }
+            assert_eq!(at, len as usize);
+            // Cores, NUMA node, packages and the group are always there; caches when sysfs has them.
+            assert_eq!(kinds & 0b11011, 0b11011);
+            // One kind only: the package records.
+            let mut plen = len;
+            assert_eq!(
+                GetLogicalProcessorInformationEx(3, buf.as_mut_ptr(), &mut plen),
+                1
+            );
+            assert!(plen > 0 && plen.is_multiple_of(48) && plen < len);
+            assert_eq!(&buf[..4], &3u32.to_le_bytes());
+            for ok in [5, 7] {
+                let mut l = 0u32;
+                GetLogicalProcessorInformationEx(ok, std::ptr::null_mut(), &mut l);
+                assert_eq!(GetLastError(), 122, "relationship {ok}");
+                let mut one = vec![0u8; l as usize];
+                assert_eq!(
+                    GetLogicalProcessorInformationEx(ok, one.as_mut_ptr(), &mut l),
+                    1
+                );
+                assert_eq!(&one[..4], &(ok as u32).to_le_bytes());
+            }
+            for bad in [8, 0xfffe] {
+                assert_eq!(
+                    GetLogicalProcessorInformationEx(bad, buf.as_mut_ptr(), &mut len),
+                    0
+                );
+                assert_eq!(GetLastError(), 87);
+            }
+            assert_eq!(
+                GetLogicalProcessorInformationEx(0, buf.as_mut_ptr(), std::ptr::null_mut()),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn native_system_info() {
+        let mut b = [0xAAu8; 48];
+        unsafe {
+            GetNativeSystemInfo(b.as_mut_ptr());
+            GetNativeSystemInfo(std::ptr::null_mut());
+        }
+        let u32_at = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        let u64_at = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+        assert_eq!(u16::from_le_bytes([b[0], b[1]]), 9);
+        assert_eq!(u32_at(4), 4096);
+        assert_eq!((u64_at(8), u64_at(16)), (0x1_0000, 0x7FFF_FFFE_FFFF));
+        assert_eq!(u64_at(24), topology::processor_mask());
+        assert_eq!(u32_at(32), u64_at(24).count_ones());
+        assert_eq!((u32_at(36), u32_at(40)), (8664, 0x1_0000));
+        assert!(u16::from_le_bytes([b[44], b[45]]) >= 6);
+        let mut c = [0u8; 48];
+        unsafe { GetSystemInfo(c.as_mut_ptr()) };
+        assert_eq!(b, c);
+    }
+
+    #[test]
+    fn system_time_adjustment() {
+        let (mut adj, mut inc, mut off) = (0u32, 0u32, 0i32);
+        unsafe {
+            assert_eq!(GetSystemTimeAdjustment(&mut adj, &mut inc, &mut off), 1);
+            assert_eq!((adj, inc, off), (156_250, 156_250, 1));
+            assert_eq!(
+                GetSystemTimeAdjustment(&mut adj, std::ptr::null_mut(), &mut off),
+                0
+            );
+            assert_eq!(GetLastError(), 87);
+        }
+    }
+
+    #[test]
+    fn available_memory_counts_the_page_cache() {
+        let avail = mem_available().unwrap();
+        let mut si: libc::sysinfo = unsafe { std::mem::zeroed() };
+        unsafe { libc::sysinfo(&mut si) };
+        let unit = si.mem_unit.max(1) as u64;
+        assert!(avail <= si.totalram as u64 * unit);
+        // MemAvailable includes the free pages (give or take what moved between the reads).
+        assert!(avail + (64 << 20) >= si.freeram as u64 * unit);
     }
 }

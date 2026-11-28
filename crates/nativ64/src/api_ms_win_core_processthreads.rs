@@ -56,8 +56,59 @@ pub static ALIASES: &[Export] = &[
     },
 ];
 
+/// The `PF_*` features (winnt.h numbering) this machine has, as Windows would answer them:
+/// CPUID bits, AVX states only when the OS saves them (XCR0), FSGSBASE only when the kernel
+/// enabled it. Computed once.
+fn processor_features() -> u64 {
+    static FEATURES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FEATURES.get_or_init(|| {
+        use std::arch::x86_64::{__cpuid, __cpuid_count};
+        let leaf1 = __cpuid(1);
+        let leaf7 = __cpuid_count(7, 0);
+        let ext1 = __cpuid(0x8000_0001);
+        let osxsave = leaf1.ecx & 1 << 27 != 0;
+        let xcr0 = if osxsave {
+            // SAFETY: OSXSAVE is set, so XGETBV is enabled; XCR0 is index 0.
+            unsafe { std::arch::x86_64::_xgetbv(0) }
+        } else {
+            0
+        };
+        let ymm = xcr0 & 0x6 == 0x6;
+        let zmm = xcr0 & 0xe6 == 0xe6;
+        // SAFETY: getauxval has no preconditions.
+        let hwcap2 = unsafe { libc::getauxval(libc::AT_HWCAP2) };
+        let bit = |b: bool, n: u32| (b as u64) << n;
+        // Every x86-64 CPU: CMPXCHG8B, MMX, SSE, RDTSC, PAE, SSE2, SSE DAZ, NX. Not
+        // PF_FASTFAIL_AVAILABLE (23): our `int 0x29` is a catchable access violation, not
+        // an uncatchable end with 0xC0000409, so the CRT must use its own fallback.
+        let baseline = [2, 3, 6, 8, 9, 10, 11, 12]
+            .iter()
+            .fold(0, |m, n| m | 1 << n);
+        baseline
+            | bit(leaf1.ecx & 1 != 0, 13) // SSE3
+            | bit(leaf1.ecx & 1 << 13 != 0, 14) // CMPXCHG16B
+            | bit(osxsave, 17) // XSAVE
+            | bit(hwcap2 & 2 != 0, 22) // RDWRFSGSBASE (HWCAP2_FSGSBASE)
+            | bit(leaf1.ecx & 1 << 30 != 0, 28) // RDRAND
+            | bit(ext1.edx & 1 << 27 != 0, 32) // RDTSCP
+            | bit(leaf7.ecx & 1 << 22 != 0, 33) // RDPID
+            | bit(ext1.ecx & 1 << 29 != 0, 35) // MONITORX
+            | bit(leaf1.ecx & 1 << 9 != 0, 36) // SSSE3
+            | bit(leaf1.ecx & 1 << 19 != 0, 37) // SSE4.1
+            | bit(leaf1.ecx & 1 << 20 != 0, 38) // SSE4.2
+            | bit(leaf1.ecx & 1 << 28 != 0 && ymm, 39) // AVX
+            | bit(leaf7.ebx & 1 << 5 != 0 && ymm, 40) // AVX2
+            | bit(leaf7.ebx & 1 << 16 != 0 && zmm, 41) // AVX512F
+            | bit(leaf7.ebx & 1 << 9 != 0, 42) // ERMS
+    })
+}
+
 win32! {
     module "api-ms-win-core-processthreads" => "kernel32";
+    // Unknown numbers, SLAT and virtualization firmware answer false.
+    Native fn IsProcessorFeaturePresent(feature: u32) -> i32 {
+        (feature < 64 && processor_features() >> feature & 1 != 0) as i32
+    }
     Native fn GetCurrentProcessId() -> u32 {
         libc::getpid() as u32
     }
@@ -225,7 +276,28 @@ win32! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::api_ms_win_core_errorhandling::GetLastError;
+
+    #[test]
+    fn processor_features_match_the_host() {
+        unsafe {
+            for f in [2, 3, 6, 8, 9, 10, 11, 12] {
+                assert_eq!(IsProcessorFeaturePresent(f), 1, "baseline feature {f}");
+            }
+            for f in [0, 1, 7, 15, 20, 21, 23, 64, 0xffff_ffff] {
+                assert_eq!(IsProcessorFeaturePresent(f), 0, "feature {f}");
+            }
+            let leaf1 = std::arch::x86_64::__cpuid(1);
+            assert_eq!(IsProcessorFeaturePresent(13), (leaf1.ecx & 1) as i32);
+            assert_eq!(IsProcessorFeaturePresent(38), (leaf1.ecx >> 20 & 1) as i32);
+            // AVX2 implies AVX: both need the OS to save the YMM state.
+            if IsProcessorFeaturePresent(40) == 1 {
+                assert_eq!(IsProcessorFeaturePresent(39), 1);
+            }
+        }
+        assert!(crate::lookup("kernel32.dll", "IsProcessorFeaturePresent").is_some());
+    }
 
     #[test]
     fn startup_info() {
