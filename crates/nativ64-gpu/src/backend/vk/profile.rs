@@ -140,3 +140,93 @@ pub(super) fn report(frame: u64, frames: u64) {
     }
     eprintln!("{line}");
 }
+
+/// What one `execute` spent, measured whatever `NATIV64_PROFILE` says (a few clock reads per
+/// import, upload and fence wait), so that a slow submission can say where its time went.
+#[derive(Clone, Copy)]
+pub(super) enum Exec {
+    /// `import_host` calls and their time.
+    Imports,
+    ImportNs,
+    /// Texture uploads, their staged bytes, and their time (hash, detile and staging).
+    Uploads,
+    UploadBytes,
+    UploadNs,
+    /// Time spent waiting on submission fences.
+    WaitNs,
+}
+
+static EXEC: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+pub(super) fn exec_add(e: Exec, n: u64) {
+    EXEC[e as usize].fetch_add(n, Relaxed);
+}
+
+/// Adds the time since `since` to `e`.
+pub(super) fn exec_since(e: Exec, since: Instant) {
+    exec_add(e, since.elapsed().as_nanos() as u64);
+}
+
+/// The totals since the last call, reset.
+pub(super) fn exec_take() -> [u64; 6] {
+    std::array::from_fn(|i| EXEC[i].swap(0, Relaxed))
+}
+
+/// An execute this long or longer logs where its time went.
+pub(super) const SLOW_EXECUTE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The line a slow execute logs: `sync` and `record` are wall times of the two halves (fence
+/// waits included), `took` the `exec_take` totals.
+pub(super) fn slow_line(
+    total: std::time::Duration,
+    sync: std::time::Duration,
+    passes: u32,
+    record: std::time::Duration,
+    draws: usize,
+    took: [u64; 6],
+) -> String {
+    let ms = |ns: u64| ns as f64 / 1e6;
+    format!(
+        "slow execute {:.0} ms ({draws} draws): sync {:.0} ms in {passes} passes, record {:.0} ms; \
+         imports {} in {:.0} ms, uploads {} ({:.1} MB) in {:.0} ms, fence wait {:.0} ms",
+        total.as_secs_f64() * 1e3,
+        sync.as_secs_f64() * 1e3,
+        record.as_secs_f64() * 1e3,
+        took[Exec::Imports as usize],
+        ms(took[Exec::ImportNs as usize]),
+        took[Exec::Uploads as usize],
+        took[Exec::UploadBytes as usize] as f64 / 1e6,
+        ms(took[Exec::UploadNs as usize]),
+        ms(took[Exec::WaitNs as usize]),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn a_slow_execute_line_gives_the_split() {
+        let mut took = [0u64; 6];
+        took[Exec::Imports as usize] = 120;
+        took[Exec::ImportNs as usize] = 900_000_000;
+        took[Exec::Uploads as usize] = 3;
+        took[Exec::UploadBytes as usize] = 4_500_000;
+        took[Exec::UploadNs as usize] = 50_000_000;
+        took[Exec::WaitNs as usize] = 7_000_000;
+        let line = slow_line(
+            Duration::from_millis(1500),
+            Duration::from_millis(400),
+            2,
+            Duration::from_millis(1100),
+            42,
+            took,
+        );
+        assert_eq!(
+            line,
+            "slow execute 1500 ms (42 draws): sync 400 ms in 2 passes, record 1100 ms; \
+             imports 120 in 900 ms, uploads 3 (4.5 MB) in 50 ms, fence wait 7 ms"
+        );
+    }
+}

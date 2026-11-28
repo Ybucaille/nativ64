@@ -314,7 +314,7 @@ impl Swapchain<'_> {
         unsafe {
             vk_try(
                 "vkWaitForFences",
-                d.wait_for_fences(&[self.frames[fi].fence], true, u64::MAX),
+                super::device::wait_fence(d, self.frames[fi].fence, "a frame"),
             )?;
             let mut tries = 0;
             let index = loop {

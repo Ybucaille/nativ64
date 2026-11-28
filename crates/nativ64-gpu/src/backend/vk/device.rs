@@ -450,10 +450,7 @@ impl Gpu {
                 vk_try("vkQueueSubmit", d.queue_submit(*q, &sub, fence))
             };
             submitted?;
-            let waited = vk_try(
-                "vkWaitForFences",
-                d.wait_for_fences(&[fence], true, u64::MAX),
-            );
+            let waited = vk_try("vkWaitForFences", wait_fence(d, fence, "a submission"));
             // The fence is unsignalled again for the next call, even after a failed wait.
             vk_try("vkResetFences", d.reset_fences(&[fence]))?;
             waited
@@ -554,6 +551,34 @@ fn entry() -> Result<Entry> {
         .get_or_init(|| unsafe { Entry::load() }.map_err(|e| e.to_string()))
         .clone()
         .map_err(VkError::Load)
+}
+
+/// How long a fence wait lasts before it logs that the fence is still unsignalled.
+const FENCE_PATIENCE_NS: u64 = 2_000_000_000;
+
+/// Waits for `fence` as `wait_for_fences(u64::MAX)` would, but in steps of
+/// `FENCE_PATIENCE_NS`, logging each step the fence is still unsignalled (a hung GPU or a
+/// deadlock shows in the log instead of a silent stall); the time goes to the execute totals.
+///
+/// # Safety
+/// `fence` belongs to `d` and is not destroyed during the call.
+pub(super) unsafe fn wait_fence(
+    d: &Device,
+    fence: vk::Fence,
+    what: &str,
+) -> ash::prelude::VkResult<()> {
+    let t0 = std::time::Instant::now();
+    let r = loop {
+        match d.wait_for_fences(&[fence], true, FENCE_PATIENCE_NS) {
+            Err(vk::Result::TIMEOUT) => eprintln!(
+                "nativ64-gpu: still waiting for the fence of {what} after {:.1} s",
+                t0.elapsed().as_secs_f64()
+            ),
+            r => break r,
+        }
+    };
+    super::profile::exec_since(super::profile::Exec::WaitNs, t0);
+    r
 }
 
 #[cfg(test)]

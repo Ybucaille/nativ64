@@ -22,7 +22,7 @@
 //! a pointer stored in memory is not translated (the stage is skipped instead, see
 //! `Translated::memory_addresses`).
 
-use super::{log_once, Gpu, HostBuffer};
+use super::{log_once, profile, Gpu, HostBuffer};
 use ash::vk;
 use nativ64::api_ms_win_core_memory as table;
 use std::collections::BTreeMap;
@@ -231,10 +231,13 @@ impl<'g> GpuMemory<'g> {
             .filter(|(_, i)| i.end > start)
             .map(|(&s, _)| s)
             .collect();
-        let ti = crate::backend::vk::profile::start();
+        let ti = profile::start();
+        let t0 = std::time::Instant::now();
         let imported = self.gpu.import_host(start as *mut u8, run_end - start);
-        crate::backend::vk::profile::stop(crate::backend::vk::profile::Phase::Import, ti);
-        crate::backend::vk::profile::count(crate::backend::vk::profile::Count::Imports, 1);
+        profile::stop(profile::Phase::Import, ti);
+        profile::count(profile::Count::Imports, 1);
+        profile::exec_since(profile::Exec::ImportNs, t0);
+        profile::exec_add(profile::Exec::Imports, 1);
         let buffer = match imported {
             Ok(b) => b,
             Err(e) => {

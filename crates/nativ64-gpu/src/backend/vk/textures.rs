@@ -46,7 +46,7 @@
 //! of a placed view is read from words 10 and 11 of its description **[unverified]**.
 
 use super::format::FormatInfo;
-use super::profile::{self, Count, Phase};
+use super::profile::{self, Count, Exec, Phase};
 use super::replay::{global_barrier, mip_count, TitleImage, VkBackend};
 use super::sampler::Spec;
 use super::{log_once, Gpu};
@@ -546,6 +546,7 @@ fn upload(
         return false;
     }
     let th = profile::start();
+    let t0 = std::time::Instant::now();
     // SAFETY: the range lies in committed, accessible pages of the memory table.
     let data = unsafe { std::slice::from_raw_parts(at as *const u8, size) };
     let hash = hash64(data);
@@ -553,6 +554,7 @@ fn upload(
     profile::stop(Phase::Hash, th);
     profile::count(Count::Hashed, size as u64);
     if t.uploaded == Some(hash) {
+        profile::exec_since(Exec::UploadNs, t0);
         return false;
     }
     let tu = profile::start();
@@ -626,6 +628,9 @@ fn upload(
     stats.uploads += 1;
     profile::count(Count::Uploads, 1);
     profile::stop(Phase::Upload, tu);
+    profile::exec_add(Exec::Uploads, 1);
+    profile::exec_add(Exec::UploadBytes, total as u64);
+    profile::exec_since(Exec::UploadNs, t0);
     true
 }
 

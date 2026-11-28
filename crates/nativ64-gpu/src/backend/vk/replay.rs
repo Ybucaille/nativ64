@@ -367,6 +367,8 @@ impl<'g> VkBackend<'g> {
     /// Replay `lists` in order and wait for the GPU to be idle.
     pub fn execute(&mut self, lists: &[Vec<Command>]) {
         let gpu = self.gpu;
+        let t0 = std::time::Instant::now();
+        super::profile::exec_take();
         let mut staging = Vec::new();
         self.reap();
         // draws and dispatches: each needs a root block, and the resources they read
@@ -386,6 +388,8 @@ impl<'g> VkBackend<'g> {
         self.tex.submission += 1;
         super::profile::count(super::profile::Count::Submissions, 1);
         let ts = super::profile::start();
+        let t_sync = std::time::Instant::now();
+        let mut passes = 0u32;
         if draws > 0 {
             // what the draws can read gets an image; the rest stays out of device memory
             self.tex.wanted = super::residency::scan(lists, &mut self.tex.reads);
@@ -394,6 +398,7 @@ impl<'g> VkBackend<'g> {
             // does not pile up (pinned host memory) before the draws.
             self.tex.capped = true;
             loop {
+                passes += 1;
                 self.tex.staged = 0;
                 self.tex.more = false;
                 let r = gpu.submit_once(|d, cb| {
@@ -412,6 +417,8 @@ impl<'g> VkBackend<'g> {
             self.tex.capped = false;
         }
         super::profile::stop(super::profile::Phase::Sync, ts);
+        let sync = t_sync.elapsed();
+        let t_record = std::time::Instant::now();
         let tr = super::profile::start();
         let r = gpu.submit_once(|d, cb| {
             for list in lists {
@@ -451,6 +458,20 @@ impl<'g> VkBackend<'g> {
         self.tex.ring.end_submission(gpu);
         self.refresh_stats();
         super::profile::stop(super::profile::Phase::Record, tr);
+        let total = t0.elapsed();
+        if total >= super::profile::SLOW_EXECUTE {
+            eprintln!(
+                "nativ64-gpu: {}",
+                super::profile::slow_line(
+                    total,
+                    sync,
+                    passes,
+                    t_record.elapsed(),
+                    draws,
+                    super::profile::exec_take()
+                )
+            );
+        }
     }
 
     /// Image of `res`, made (and moved to `GENERAL`) at first use; None when the resource is
