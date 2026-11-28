@@ -453,3 +453,25 @@ fa02027e000101ff	v_mov_b32_dpp v1, v0 row_shl:1 row_mask:0xf bank_mask:0xf
 1f08d4d800000001	ds_swizzle_b32 v1, v0 offset:swizzle(BITMASK_PERM,"pppip")
 3c00d4d800000001	ds_swizzle_b32 v1, v0 offset:swizzle(BITMASK_PERM,"ppp01")
 fa040206001b00ff	v_add_f32_dpp v1, v0, v2 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf
+8300827d	v_cmp_lt_u32_e32 vcc_lo, 3, v0
+080061d76a0a0102	v_writelane_b32 v8, vcc_lo, 5
+8003eabe	s_mov_b32 vcc_lo, 0
+030060d7080b0102	v_readlane_b32 s3, v8, 5
+010001d580020d00	v_cndmask_b32_e64 v1, 0, 1, s3
+7e037e87	s_and_b32 exec_lo, exec_lo, s3
+6a0f84be	s_bcnt1_i32_b32 s4, vcc_lo
+6a1385be	s_ff1_i32_b32 s5, vcc_lo
+060060d7020b0002	v_readlane_b32 s6, v2, s5
+030065d76a000102	v_mbcnt_lo_u32_b32 v3, vcc_lo, 0
+8300827d	[w64] v_cmp_lt_u32_e32 vcc, 3, v0
+6a1084be	[w64] s_bcnt1_i32_b64 s4, vcc
+030065d76a000102	[w64] v_mbcnt_lo_u32_b32 v3, vcc_lo, 0
+030066d76b060202	[w64] v_mbcnt_hi_u32_b32 v3, vcc_hi, v3
+6a1485be	[w64] s_ff1_i32_b64 s5, vcc
+060060d7020b0002	[w64] v_readlane_b32 s6, v2, s5
+0602087e	v_mov_b32_e32 v4, s6
+0581068f	s_lshl_b32 s6, s5, 1
+6a8006bf	s_cmp_eq_u32 vcc_lo, 0
+6a8007bf	s_cmp_lg_u32 vcc_lo, 0
+6a7e06bf	s_cmp_eq_u32 vcc_lo, exec_lo
+81800785	s_cselect_b32 s7, 1, 0

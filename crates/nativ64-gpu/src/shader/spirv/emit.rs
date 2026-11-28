@@ -155,6 +155,61 @@ impl Gen {
         self.op(Op::GroupNonUniformQuadSwap, t, &[scope, a, d])
     }
 
+    /// `OpGroupNonUniformAll` over the subgroup.
+    pub(super) fn all(&mut self, a: u32) -> u32 {
+        self.m.capability(Capability::GroupNonUniformVote);
+        self.wave = true;
+        let t = self.t_bool();
+        let scope = self.k(3);
+        self.op(Op::GroupNonUniformAll, t, &[scope, a])
+    }
+
+    /// `OpGroupNonUniformBallot`: the bits of the invocations whose `pred` is set (a `uvec4`
+    /// indexed by host lane).
+    fn ballot(&mut self, pred: u32) -> u32 {
+        self.m.capability(Capability::GroupNonUniformBallot);
+        self.wave = true;
+        let u = self.t_u32();
+        let t = self.m.global(Op::TypeVector, None, &[u, 4]);
+        let scope = self.k(3);
+        self.op(Op::GroupNonUniformBallot, t, &[scope, pred])
+    }
+
+    /// The number of invocations of the subgroup whose `pred` is set.
+    pub(super) fn ballot_count(&mut self, pred: u32) -> u32 {
+        let b = self.ballot(pred);
+        let t = self.t_u32();
+        let scope = self.k(3);
+        // the group operation is a literal: 0 reduce
+        self.op(Op::GroupNonUniformBallotBitCount, t, &[scope, 0, b])
+    }
+
+    /// The number of invocations before this one (in host lane order) whose `pred` is set.
+    pub(super) fn ballot_rank(&mut self, pred: u32) -> u32 {
+        let b = self.ballot(pred);
+        let t = self.t_u32();
+        let scope = self.k(3);
+        // 2 exclusive scan
+        self.op(Op::GroupNonUniformBallotBitCount, t, &[scope, 2, b])
+    }
+
+    /// The host lane of the first invocation whose `pred` is set.
+    pub(super) fn ballot_first(&mut self, pred: u32) -> u32 {
+        let b = self.ballot(pred);
+        let t = self.t_u32();
+        let scope = self.k(3);
+        self.op(Op::GroupNonUniformBallotFindLSB, t, &[scope, b])
+    }
+
+    /// The value `a` has in the invocation of host lane `lane`.
+    pub(super) fn shuffle(&mut self, a: u32, lane: u32) -> u32 {
+        self.m.capability(Capability::GroupNonUniformShuffle);
+        self.wave = true;
+        let t = self.t_u32();
+        let scope = self.k(3);
+        self.op(Op::GroupNonUniformShuffle, t, &[scope, a, lane])
+    }
+
     /// Starts a new (unreachable) block when the current one already ended.
     fn open(&mut self) {
         if self.terminated {
@@ -775,9 +830,14 @@ impl Tr<'_> {
                     let Some(&Src::Const(_) | &Src::Val(_)) = i.srcs[0].first() else {
                         return bad("a spilled scalar that is not a dword");
                     };
+                    // a spilled lane mask is the lane's bit, 0 or 1, in the slot
                     let x = self.read(i.srcs[0][0])?;
-                    let Opd::V(x) = x else {
-                        return bad("a lane mask spilled into a lane");
+                    let x = match x {
+                        Opd::V(x) => x,
+                        Opd::B(b) => {
+                            let (one, zero) = (self.g.k(1), self.g.k(0));
+                            self.g.select(b, one, zero)
+                        }
                     };
                     let var = self.slots[&(vgpr, lane)];
                     self.g.store(var, x);
@@ -816,6 +876,54 @@ impl Tr<'_> {
                     srcs[0][0] = r;
                 }
                 wave = Some(r);
+            }
+            let dword = |s: &Vec<Vec<Opd<Gen>>>, k: usize| match s.get(k).and_then(|d| d.first()) {
+                Some(&Opd::V(x)) => Some(x),
+                _ => None,
+            };
+            match lane_use {
+                Some(LaneUse::BallotCount | LaneUse::FirstSet | LaneUse::Rank { hi: false }) => {
+                    let bit = self.mask_bit(&srcs[0]);
+                    let r = match lane_use {
+                        Some(LaneUse::BallotCount) => self.g.ballot_count(bit),
+                        Some(LaneUse::FirstSet) => self.g.ballot_first(bit),
+                        _ => {
+                            let (Some(x), rank) = (dword(&srcs, 1), self.g.ballot_rank(bit)) else {
+                                return bad("a mask count that does not start from a dword");
+                            };
+                            self.g.ibin(IBin::Add, rank, x)
+                        }
+                    };
+                    wave = Some(Opd::V(r));
+                }
+                Some(u @ (LaneUse::MaskZero { eq } | LaneUse::MasksEqual { eq })) => {
+                    let (a, b) = (self.mask_bit(&srcs[0]), self.mask_bit(&srcs[1]));
+                    let same = if matches!(u, LaneUse::MaskZero { .. }) {
+                        // the mask against zero: one operand is a mask, the other all zero
+                        let bit = self.g.bor(a, b);
+                        let any = self.g.any(bit);
+                        self.g.bnot(any)
+                    } else {
+                        let ne = self.g.bxor(a, b);
+                        let e = self.g.bnot(ne);
+                        self.g.all(e)
+                    };
+                    let flag = if eq { same } else { self.g.bnot(same) };
+                    wave = Some(Opd::B(flag));
+                }
+                Some(LaneUse::Rank { hi: true }) => {
+                    let Some(x) = dword(&srcs, 1) else {
+                        return bad("a mask count that does not start from a dword");
+                    };
+                    wave = Some(Opd::V(x));
+                }
+                Some(LaneUse::ReadHostLane) => {
+                    let (Some(x), Some(lane)) = (dword(&srcs, 0), dword(&srcs, 1)) else {
+                        return bad("a readlane of something that is not a dword");
+                    };
+                    wave = Some(Opd::V(self.g.shuffle(x, lane)));
+                }
+                _ => {}
             }
             let mut imps = Vec::new();
             for &(r, s) in &i.imps {
@@ -884,6 +992,29 @@ impl Tr<'_> {
             }
         }
         Ok(())
+    }
+
+    /// The lane's bit of a lane mask operand (its dwords are all the lane's bit; zeros
+    /// stand for the dwords a wave32 value leaves out).
+    fn mask_bit(&mut self, dwords: &[Opd<Gen>]) -> u32 {
+        let tb = self.g.t_bool();
+        let mut acc: Option<u32> = None;
+        for &d in dwords {
+            let b = match d {
+                Opd::B(b) => b,
+                Opd::V(v) => {
+                    let (one, zero) = (self.g.k(1), self.g.k(0));
+                    let t = self.g.t_u32();
+                    let a = self.g.op(Op::BitwiseAnd, t, &[v, one]);
+                    self.g.op(Op::INotEqual, tb, &[a, zero])
+                }
+            };
+            acc = Some(match acc {
+                Some(a) => self.g.bor(a, b),
+                None => b,
+            });
+        }
+        acc.unwrap_or_else(|| self.g.kb(false))
     }
 
     /// True when the branch of block `b` is taken.

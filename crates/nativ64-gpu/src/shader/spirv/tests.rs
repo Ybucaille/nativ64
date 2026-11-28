@@ -127,8 +127,12 @@ fn lane_inst(
         }
         Some(&LaneUse::SlotRead { vgpr, lane }) => {
             let x = st.slots.get(&(vgpr, lane)).copied().unwrap_or(0);
-            st.env.insert(i.dsts[0].1, Opd::V(x));
-            st.out.insert((i.dsts[0].0, false), x);
+            let mask = s.masks.is_mask(i.dsts[0].1);
+            st.env.insert(
+                i.dsts[0].1,
+                if mask { Opd::B(x & 1 != 0) } else { Opd::V(x) },
+            );
+            st.out.insert((i.dsts[0].0, mask), x);
             return Ok(());
         }
         _ => {}
@@ -199,7 +203,6 @@ fn interp_wave(
     lanes: &[u32],
     host: usize,
 ) -> Result<Vec<Out>, SpirvError> {
-    let _ = host;
     let mut sts: Vec<LaneSt> = Vec::new();
     for (n, &lane) in lanes.iter().enumerate() {
         let mut st = LaneSt {
@@ -256,6 +259,82 @@ fn interp_wave(
                                 Swap::Result(x)
                             }),
                         )?;
+                    }
+                }
+                Some(u @ (LaneUse::MaskZero { eq } | LaneUse::MasksEqual { eq })) => {
+                    // the two operands' bits per lane, and the group's answer
+                    let bit = |st: &LaneSt, k: usize| {
+                        i.srcs[k].iter().try_fold(false, |a, &d| {
+                            rd(&st.env, d).map(|o| a | (as_u32(o) & 1 != 0))
+                        })
+                    };
+                    let (mut a, mut b) = (Vec::new(), Vec::new());
+                    for st in &sts {
+                        a.push(bit(st, 0)?);
+                        b.push(bit(st, 1)?);
+                    }
+                    for n in 0..sts.len() {
+                        let g0 = n / host * host;
+                        let group = g0..(g0 + host).min(sts.len());
+                        let same = if matches!(u, LaneUse::MaskZero { .. }) {
+                            !group.clone().any(|k| a[k] | b[k])
+                        } else {
+                            group.clone().all(|k| a[k] == b[k])
+                        };
+                        let flag = same == eq;
+                        lane_inst(f, s, at, &mut sts[n], Some(Swap::Result(u32::from(flag))))?;
+                    }
+                }
+                Some(
+                    u @ (LaneUse::BallotCount
+                    | LaneUse::FirstSet
+                    | LaneUse::Rank { .. }
+                    | LaneUse::ReadHostLane),
+                ) => {
+                    // the lane's bit of the mask operand, and its lane operand / count source
+                    let bits: Vec<bool> = sts
+                        .iter()
+                        .map(|st| {
+                            i.srcs[0].iter().try_fold(false, |a, &d| {
+                                rd(&st.env, d).map(|o| a | (as_u32(o) & 1 != 0))
+                            })
+                        })
+                        .collect::<Result<_, _>>()?;
+                    let src = |st: &LaneSt, k: usize| rd(&st.env, i.srcs[k][0]).map(as_u32);
+                    let vals: Vec<u32> = sts
+                        .iter()
+                        .map(|st| match u {
+                            LaneUse::ReadHostLane | LaneUse::Rank { .. } => {
+                                src(st, if u == LaneUse::ReadHostLane { 0 } else { 1 })
+                            }
+                            _ => Ok(0),
+                        })
+                        .collect::<Result<_, _>>()?;
+                    let mut res = Vec::new();
+                    for n in 0..sts.len() {
+                        let g0 = n / host * host;
+                        let group = g0..(g0 + host).min(sts.len());
+                        res.push(match u {
+                            LaneUse::BallotCount => {
+                                bits[group].iter().filter(|b| **b).count() as u32
+                            }
+                            LaneUse::FirstSet => bits[group]
+                                .iter()
+                                .position(|b| *b)
+                                .map_or(u32::MAX, |p| p as u32),
+                            LaneUse::Rank { hi: false } => {
+                                (g0..n).filter(|&k| bits[k]).count() as u32 + vals[n]
+                            }
+                            LaneUse::Rank { hi: true } => vals[n],
+                            _ => {
+                                // the lane operand is a host lane of the group
+                                let lane = src(&sts[n], 1)? as usize;
+                                vals[g0 + lane]
+                            }
+                        });
+                    }
+                    for (st, x) in sts.iter_mut().zip(res) {
+                        lane_inst(f, s, at, st, Some(Swap::Result(x)))?;
                     }
                 }
                 _ => {
@@ -3689,4 +3768,131 @@ fn what_leaves_the_quad_stays_refused_by_name() {
         first_cross_lane(&["ds_swizzle_b32 v1, v0 offset:swizzle(BITMASK_PERM,\"11110\")"]),
         "ds_swizzle_b32"
     );
+}
+
+#[test]
+fn a_spilled_lane_mask_comes_back_as_the_same_mask() {
+    // VCC goes into a lane of a slot, is clobbered, and comes back through `v_readlane` as the
+    // lane's own bit: per lane the spill is the identity
+    let lines = [
+        "v_cmp_lt_u32_e32 vcc_lo, 3, v0",
+        "v_writelane_b32 v8, vcc_lo, 5",
+        "s_mov_b32 vcc_lo, 0",
+        "v_readlane_b32 s3, v8, 5",
+        "v_cndmask_b32_e64 v1, 0, 1, s3",
+    ];
+    let (fun, s) = wave_ok(&lines);
+    assert!(s.masks.slot_masks.contains(&(8, 5)));
+    module_of(&fun).unwrap();
+    let out = lock(&fun, &s, 8, 8, |l| vec![(Reg::V(0), l)]);
+    let got: Vec<u32> = out.iter().map(|o| get(o, Reg::V(1))).collect();
+    assert_eq!(got, [0, 0, 0, 0, 1, 1, 1, 1]);
+}
+
+fn ballot_expect(lanes: u32, host: u32, set: impl Fn(u32) -> bool) -> Vec<(u32, u32, u32)> {
+    // per lane: the count of set bits in its group, the first set host lane, the set bits
+    // before it
+    (0..lanes)
+        .map(|n| {
+            let g0 = n / host * host;
+            let count = (g0..g0 + host).filter(|&k| set(k)).count() as u32;
+            let first = (g0..g0 + host)
+                .position(&set)
+                .map_or(u32::MAX, |p| p as u32);
+            let rank = (g0..n).filter(|&k| set(k)).count() as u32;
+            (count, first, rank)
+        })
+        .collect()
+}
+
+#[test]
+fn ballots_count_find_and_rank_the_set_lanes_of_the_host_group() {
+    for (w64, lines) in [
+        (
+            false,
+            vec![
+                "v_cmp_lt_u32_e32 vcc_lo, 3, v0",
+                "s_bcnt1_i32_b32 s4, vcc_lo",
+                "s_ff1_i32_b32 s5, vcc_lo",
+                "v_readlane_b32 s6, v2, s5",
+                "v_mbcnt_lo_u32_b32 v3, vcc_lo, 0",
+                "v_mov_b32_e32 v4, s6",
+            ],
+        ),
+        (
+            true,
+            vec![
+                "[w64] v_cmp_lt_u32_e32 vcc, 3, v0",
+                "[w64] s_bcnt1_i32_b64 s4, vcc",
+                "[w64] s_ff1_i32_b64 s5, vcc",
+                "[w64] v_readlane_b32 s6, v2, s5",
+                "[w64] v_mbcnt_lo_u32_b32 v3, vcc_lo, 0",
+                "[w64] v_mbcnt_hi_u32_b32 v3, vcc_hi, v3",
+                "v_mov_b32_e32 v4, s6",
+            ],
+        ),
+    ] {
+        let (fun, s) = wave_ok(&lines);
+        module_of(&fun).unwrap();
+        for host in [8u32, 16, 32] {
+            let out = lock(&fun, &s, 32, host as usize, |l| {
+                vec![(Reg::V(0), l), (Reg::V(2), 500 + 3 * l)]
+            });
+            // the compare is on v0 = the lane: the bits are lane > 3
+            let want2 = ballot_expect(32, host, |k| k > 3);
+            for (n, o) in out.iter().enumerate() {
+                let (count, first, rank) = want2[n];
+                assert_eq!(get(o, Reg::S(4)), count, "w64 {w64} host {host} lane {n}");
+                assert_eq!(get(o, Reg::V(3)), rank, "w64 {w64} host {host} lane {n}");
+                let g0 = n as u32 / host * host;
+                if first != u32::MAX {
+                    assert_eq!(
+                        get(o, Reg::V(4)),
+                        500 + 3 * (g0 + first),
+                        "host {host} lane {n}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_ballot_lane_number_that_is_read_as_data_is_refused() {
+    // the first set lane is a host lane: shifting it into a mask would mix it with console lanes
+    assert_eq!(
+        first_cross_lane(&[
+            "v_cmp_lt_u32_e32 vcc_lo, 3, v0",
+            "s_ff1_i32_b32 s5, vcc_lo",
+            "s_lshl_b32 s6, s5, 1",
+        ]),
+        "s_ff1_i32_b32"
+    );
+}
+
+#[test]
+fn a_mask_compared_with_zero_or_another_mask_is_a_vote() {
+    let flag = |lines: &[&str], lanes: u32, host: usize, f: fn(u32) -> u32| -> Vec<u32> {
+        let (fun, s) = wave_ok(lines);
+        module_of(&fun).unwrap();
+        let out = lock(&fun, &s, lanes, host, |l| vec![(Reg::V(0), f(l))]);
+        out.iter().map(|o| get(o, Reg::S(7))).collect()
+    };
+    let cmp = "v_cmp_lt_u32_e32 vcc_lo, 3, v0";
+    // lg: some lane has its bit set; eq: none does
+    let lg = [cmp, "s_cmp_lg_u32 vcc_lo, 0", "s_cselect_b32 s7, 1, 0"];
+    let eq = [cmp, "s_cmp_eq_u32 vcc_lo, 0", "s_cselect_b32 s7, 1, 0"];
+    // 16 lanes, host groups of 8: the first group (lanes 0..8) has bits 4..8 set, a group of
+    // lanes below 4 has none
+    assert_eq!(flag(&lg, 16, 8, |l| l), vec![1; 16]);
+    assert_eq!(flag(&eq, 16, 8, |l| l), vec![0; 16]);
+    assert_eq!(flag(&lg, 16, 4, |l| l), [vec![0; 4], vec![1; 12]].concat());
+    // vcc against EXEC (all ones): equal when every lane of the group has its bit set
+    let same = [
+        cmp,
+        "s_cmp_eq_u32 vcc_lo, exec_lo",
+        "s_cselect_b32 s7, 1, 0",
+    ];
+    assert_eq!(flag(&same, 8, 4, |_| 9), vec![1; 8]);
+    assert_eq!(flag(&same, 8, 4, |l| l), [vec![0; 4], vec![1; 4]].concat());
 }

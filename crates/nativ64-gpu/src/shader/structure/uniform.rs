@@ -28,6 +28,74 @@ pub enum LaneUse {
     /// `ds_swizzle_b32` in quad mode, or a DPP `quad_perm` / `dpp8` that stays in the quad of
     /// 4 lanes: lane `k` of each quad reads the source of lane `sel[k]`.
     Quad { sel: [u8; 4] },
+    /// `s_bcnt1_i32` of a lane mask: the number of invocations (of the host's active set)
+    /// whose bit is set.
+    BallotCount,
+    /// `s_ff1_i32` of a lane mask: the host lane of the first invocation whose bit is set. A
+    /// host lane number, so it is only ever read as the lane of a `ReadHostLane`.
+    FirstSet,
+    /// `v_readlane` of the lane a `FirstSet` found: that invocation's value, in every one.
+    ReadHostLane,
+    /// `v_mbcnt_lo(mask, x)` is `x` plus the number of invocations before this one whose bit
+    /// is set; `v_mbcnt_hi(mask, x)` right after it adds nothing (the count already covers the
+    /// whole wave).
+    Rank { hi: bool },
+    /// `s_cmp_eq/lg` of a lane mask with zero: SCC is "no invocation has its bit set"
+    /// (`eq`) or "some invocation does".
+    MaskZero { eq: bool },
+    /// `s_cmp_eq/lg` of two lane masks: SCC is "every invocation has the same two bits" or
+    /// its negation.
+    MasksEqual { eq: bool },
+}
+
+/// How many times each value is read, and how many of those reads are the lane operand of a
+/// `v_readlane`.
+#[derive(Default)]
+struct Reads {
+    all: HashMap<Val, usize>,
+    as_lane: HashMap<Val, usize>,
+}
+
+fn count_reads(f: &Func) -> Reads {
+    let mut r = Reads::default();
+    let mut add = |s: &Src| {
+        if let Src::Val(v) = s {
+            *r.all.entry(*v).or_default() += 1;
+        }
+    };
+    for blk in &f.blocks {
+        for p in &blk.phis {
+            p.args.iter().for_each(|(_, s)| add(s));
+        }
+        for inst in &blk.insts {
+            inst.srcs.iter().flatten().for_each(&mut add);
+            inst.imps.iter().for_each(|(_, s)| add(s));
+        }
+        if let Term::Branch { cond, .. } = &blk.term {
+            cond.iter().for_each(|(_, s)| add(s));
+        }
+    }
+    for blk in &f.blocks {
+        for inst in &blk.insts {
+            if inst.instr.name() == "v_readlane_b32" {
+                if let Some(Src::Val(v)) = inst.srcs.get(1).and_then(|s| s.first()) {
+                    *r.as_lane.entry(*v).or_default() += 1;
+                }
+            }
+        }
+    }
+    r
+}
+
+/// Operand `k` of `inst` is made of lane mask dwords (and zeros): what the ballot reads.
+fn mask_operand(m: &Masks, inst: &Inst, k: usize) -> bool {
+    let Some(d) = inst.srcs.get(k) else {
+        return false;
+    };
+    let is_mask = |s: &Src| matches!(s, Src::Val(x) if m.masks.contains(x));
+    d.iter().any(is_mask)
+        && d.iter()
+            .all(|s| is_mask(s) || matches!(s, Src::Const(0) | Src::Undef))
 }
 
 /// The quad permutation of a `ds_swizzle_b32` or a DPP instruction, when it stays inside the
@@ -346,37 +414,42 @@ fn inst_uniform(
 }
 
 /// The VGPRs that only spill SGPRs: every definition is `v_writelane` at a constant lane and
-/// every read is `v_readlane` at a constant lane (and nothing else names them).
-pub(super) fn slot_vgprs(f: &Func, m: &Masks) -> HashSet<u16> {
+/// every read is `v_readlane` at a constant lane (and nothing else names them). Also the slots
+/// (`(vgpr, lane)`) that hold a lane mask: spilled EXEC and VCC dwords, which come back as masks
+/// (a write of a mask and of a plain dword to one slot is refused).
+pub(super) fn slot_vgprs(f: &Func, m: &Masks) -> (HashSet<u16>, HashSet<(u16, u8)>) {
     let (mut good, mut bad) = (HashSet::new(), HashSet::new());
+    let mut kinds: HashMap<(u16, u8), bool> = HashMap::new();
     let vgpr = |r: Reg| match r {
         Reg::V(k) => Some(k),
         _ => None,
     };
     let reg_of = |x: &Val| f.vals[x.0 as usize].reg;
+    let lane_of = |inst: &Inst, k: usize| match inst.srcs.get(k).and_then(|s| s.first()) {
+        Some(Src::Const(c)) => Some((c & if f.wave32 { 31 } else { 63 }) as u8),
+        _ => None,
+    };
     for &(r, _) in &f.args {
         bad.extend(vgpr(r));
     }
     for blk in &f.blocks {
         for inst in &blk.insts {
             let n = inst.instr.name();
-            let konst = |k: usize| {
-                matches!(
-                    inst.srcs.get(k).and_then(|s| s.first()),
-                    Some(Src::Const(_))
-                )
-            };
-            if n == "v_writelane_b32" && konst(1) && inst.dsts.len() == 1 {
-                // the scalar spilled is a plain dword: not a lane mask, not a VGPR
-                let plain = !matches!(
-                    inst.srcs[0].first(),
-                    Some(Src::Val(x)) if m.masks.contains(x) || vgpr(reg_of(x)).is_some()
-                );
+            if n == "v_writelane_b32" && lane_of(inst, 1).is_some() && inst.dsts.len() == 1 {
+                // the scalar spilled is a plain dword or a lane mask, not a VGPR
+                let src = inst.srcs[0].first();
+                let is_vgpr = matches!(src, Some(Src::Val(x)) if vgpr(reg_of(x)).is_some());
+                let is_mask = matches!(src, Some(Src::Val(x)) if m.masks.contains(x));
                 let k = vgpr(inst.dsts[0].0);
-                if let (Some(k), true) = (k, plain) {
-                    good.insert(k);
-                } else {
-                    bad.extend(k);
+                match (k, is_vgpr) {
+                    (Some(k), false) => {
+                        good.insert(k);
+                        let lane = lane_of(inst, 1).unwrap_or(0);
+                        if *kinds.entry((k, lane)).or_insert(is_mask) != is_mask {
+                            bad.insert(k);
+                        }
+                    }
+                    _ => bad.extend(k),
                 }
                 // the old value of the slot is an implicit read of the same register
                 for (r, _) in &inst.imps {
@@ -386,7 +459,7 @@ pub(super) fn slot_vgprs(f: &Func, m: &Masks) -> HashSet<u16> {
                 }
                 continue;
             }
-            if n == "v_readlane_b32" && konst(1) {
+            if n == "v_readlane_b32" && lane_of(inst, 1).is_some() {
                 if let Some(Src::Val(x)) = inst.srcs[0].first() {
                     good.extend(vgpr(reg_of(x)));
                 }
@@ -403,7 +476,28 @@ pub(super) fn slot_vgprs(f: &Func, m: &Masks) -> HashSet<u16> {
             }
         }
     }
-    good.difference(&bad).copied().collect()
+    let slots: HashSet<u16> = good.difference(&bad).copied().collect();
+    let masks = kinds
+        .into_iter()
+        .filter(|((k, _), mask)| *mask && slots.contains(k))
+        .map(|(key, _)| key)
+        .collect();
+    (slots, masks)
+}
+
+/// The destinations of the `v_readlane` instructions that read a mask slot: lane masks too.
+pub(super) fn mask_slot_reads(f: &Func, m: &Masks) -> HashSet<Val> {
+    let mut out = HashSet::new();
+    for blk in &f.blocks {
+        for inst in &blk.insts {
+            if let Some(LaneUse::SlotRead { vgpr, lane }) = m.lanes.get(&inst.instr.at) {
+                if m.slot_masks.contains(&(*vgpr, *lane)) {
+                    out.extend(inst.dsts.first().map(|d| d.1));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// The meaning of a cross-lane-by-nature instruction under items 1-4, when it has one.
@@ -413,6 +507,7 @@ pub(super) fn lane_use(
     slots: &HashSet<u16>,
     inst: &Inst,
     eq_cmps: &[Vec<Src>],
+    first_set: &HashSet<Val>,
 ) -> Option<LaneUse> {
     let i = &inst.instr;
     let n = i.name();
@@ -454,7 +549,54 @@ pub(super) fn lane_use(
                 }
             }
         }
-        return uniform(src(0)).then_some(LaneUse::Copy);
+        if uniform(src(0)) {
+            return Some(LaneUse::Copy);
+        }
+        return matches!(src(1), Some(Src::Val(v)) if first_set.contains(&v))
+            .then_some(LaneUse::ReadHostLane);
+    }
+    if matches!(
+        n,
+        "s_cmp_eq_u32" | "s_cmp_lg_u32" | "s_cmp_eq_u64" | "s_cmp_lg_u64"
+    ) {
+        let eq = n.contains("_eq_");
+        let zero = |k: usize| {
+            inst.srcs
+                .get(k)
+                .is_some_and(|d| d.iter().all(|s| matches!(s, Src::Const(0))))
+        };
+        if mask_operand(m, inst, 0) && mask_operand(m, inst, 1) {
+            return Some(LaneUse::MasksEqual { eq });
+        }
+        if (mask_operand(m, inst, 0) && zero(1)) || (zero(0) && mask_operand(m, inst, 1)) {
+            return Some(LaneUse::MaskZero { eq });
+        }
+        return None;
+    }
+    if n.starts_with("s_bcnt1_i32_b") && mask_operand(m, inst, 0) {
+        return Some(LaneUse::BallotCount);
+    }
+    if n.starts_with("s_ff1_i32_b") && mask_operand(m, inst, 0) {
+        return inst
+            .dsts
+            .first()
+            .is_some_and(|(_, v)| first_set.contains(v))
+            .then_some(LaneUse::FirstSet);
+    }
+    if (n == "v_mbcnt_lo_u32_b32" || n == "v_mbcnt_hi_u32_b32") && mask_operand(m, inst, 0) {
+        let hi = n == "v_mbcnt_hi_u32_b32";
+        // the high half only follows the low one of the same count
+        let after_lo = match src(1) {
+            Some(Src::Val(x)) => match f.vals[x.0 as usize].def {
+                ValDef::Inst { block, index } => {
+                    let d = &f.blocks[block].insts[index];
+                    d.instr.name() == "v_mbcnt_lo_u32_b32" && mask_operand(m, d, 0)
+                }
+                _ => false,
+            },
+            _ => false,
+        };
+        return (!hi || after_lo).then_some(LaneUse::Rank { hi });
     }
     if n.starts_with("v_readfirstlane") {
         if uniform(src(0)) {
@@ -493,10 +635,25 @@ pub(super) fn eq_compares(f: &Func) -> Vec<Vec<Src>> {
 /// byte offset of the instruction.
 pub(super) fn lane_uses(f: &Func, m: &Masks, slots: &HashSet<u16>) -> HashMap<usize, LaneUse> {
     let eq = eq_compares(f);
+    // `s_ff1` of a mask whose result is only ever the lane of a `v_readlane`
+    let reads = count_reads(f);
+    let mut first_set = HashSet::new();
+    for blk in &f.blocks {
+        for inst in &blk.insts {
+            if inst.instr.name().starts_with("s_ff1_i32_b") && mask_operand(m, inst, 0) {
+                if let Some(&(_, v)) = inst.dsts.first() {
+                    let n = reads.all.get(&v).copied().unwrap_or(0);
+                    if n == reads.as_lane.get(&v).copied().unwrap_or(0) {
+                        first_set.insert(v);
+                    }
+                }
+            }
+        }
+    }
     let mut out = HashMap::new();
     for blk in &f.blocks {
         for inst in &blk.insts {
-            if let Some(u) = lane_use(f, m, slots, inst, &eq) {
+            if let Some(u) = lane_use(f, m, slots, inst, &eq, &first_set) {
                 out.insert(inst.instr.at, u);
             }
         }

@@ -203,6 +203,7 @@ fn irreducible_graph_is_an_error() {
 #[test]
 fn cross_lane_use_names_the_instruction() {
     // v_cmp_lt_f32 vcc ; s_bcnt1_i32_b64 s0, vcc ; v_readfirstlane_b32 s1, v0 ; s_endpgm
+    // (the count of a mask is a ballot; the readfirstlane of a lane-wise value is not)
     let words = [0x7c020300, 0xbe80106a, 0x7e020500, 0xbf810000];
     let f = func(&words);
     let m = type_masks(&f);
@@ -211,13 +212,10 @@ fn cross_lane_use_names_the_instruction() {
         .iter()
         .map(|c| (c.at, c.name.as_str()))
         .collect();
-    assert_eq!(
-        names,
-        vec![(4, "s_bcnt1_i32_b64"), (8, "v_readfirstlane_b32")]
-    );
+    assert_eq!(names, vec![(8, "v_readfirstlane_b32")]);
     match structure(&f) {
         Err(StructError::CrossLane(c)) => {
-            assert_eq!((c.at, c.name.as_str()), (4, "s_bcnt1_i32_b64"))
+            assert_eq!((c.at, c.name.as_str()), (8, "v_readfirstlane_b32"))
         }
         r => panic!("{r:?}"),
     }

@@ -553,6 +553,11 @@ pub fn exec<K: Backend>(b: &mut K, c: &Ctx<K>) -> Result<Vec<Opd<K>>, Unsupporte
         mods,
     };
     let res = match c.wave {
+        // a compare that only sets SCC: the value is the flag
+        Some(w) if i.dpp.is_none() && x.width() == 0 => Res {
+            data: vec![],
+            scc: Some(x.as_v(w)),
+        },
         Some(w) if i.dpp.is_none() => {
             let scc = if x.writes_scc() { x.scc_nz(&[w]) } else { None };
             Res { data: vec![w], scc }

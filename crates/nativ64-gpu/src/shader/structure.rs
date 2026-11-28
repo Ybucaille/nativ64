@@ -217,6 +217,8 @@ pub struct Masks {
     pub uniform_vals: Vec<Option<Dom>>,
     /// VGPRs that only spill SGPRs into lanes (`v_writelane` / `v_readlane` at constant lanes).
     pub slots: HashSet<u16>,
+    /// The slots (`(vgpr, lane)`) of those that hold a spilled lane mask.
+    pub slot_masks: HashSet<(u16, u8)>,
     /// The wave instructions items 1-4 of the chunk 7 design give a meaning to, by the byte
     /// offset of the instruction. They are not in `cross_lane`.
     pub lanes: HashMap<usize, LaneUse>,
@@ -263,7 +265,23 @@ impl Masks {
 /// `saveexec` forms) whose inputs are masks or the constants 0 / -1, or a phi of such values.
 /// Typing starts optimistic and drops what its inputs refute, so loop-carried masks type.
 pub fn type_masks(f: &Func) -> Masks {
+    // what a mask slot gives back is a mask: typing it can type the operations on it, which
+    // can type more spills, so the typing runs again with the new seeds until nothing moves
+    let mut seeds = HashSet::new();
+    for _ in 0..4 {
+        let m = type_masks_with(f, &seeds);
+        let more = uniform::mask_slot_reads(f, &m);
+        if more == seeds {
+            return m;
+        }
+        seeds = more;
+    }
+    type_masks_with(f, &HashSet::new())
+}
+
+fn type_masks_with(f: &Func, seeds: &HashSet<Val>) -> Masks {
     let mut m = Masks::default();
+    m.masks.extend(seeds.iter().copied());
     for &(r, v) in &f.args {
         if is_exec(r) {
             m.masks.insert(v);
@@ -341,7 +359,7 @@ pub fn type_masks(f: &Func) -> Masks {
     }
     uniform_masks(f, &mut m);
     m.uniform_vals = uniform::uniform_vals(f, &m);
-    m.slots = uniform::slot_vgprs(f, &m);
+    (m.slots, m.slot_masks) = uniform::slot_vgprs(f, &m);
     m.lanes = uniform::lane_uses(f, &m, &m.slots);
     for blk in &f.blocks {
         for inst in &blk.insts {
